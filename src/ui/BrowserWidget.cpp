@@ -418,7 +418,16 @@ void BrowserWidget::goUp()
     QDir d(folderList_->folder());
     if (folderList_->folder().isEmpty() || !d.cdUp()) return;
     const QString child = folderList_->folder();
-    if (openFolder(d.absolutePath())) selectPath(child);
+    if (openFolder(d.absolutePath())) {
+        selectPath(child);
+        focusFileArea();
+    }
+}
+
+// 把焦点交给当前视图(缩略图/图标/列表/详细),方向键才能选文件
+void BrowserWidget::focusFileArea()
+{
+    activeView()->setFocus();
 }
 
 // 全选(不含 "..")
@@ -628,7 +637,7 @@ void BrowserWidget::onPathActivated()
 {
     const QString text = pathBox_->currentText().trimmed();
     if (text.isEmpty()) return;
-    if (openFolder(text)) activeView()->setFocus();
+    if (openFolder(text)) focusFileArea();
 }
 
 // 文件区选择变化

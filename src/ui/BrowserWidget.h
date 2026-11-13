@@ -42,6 +42,9 @@ public:
     void refresh();
     // 上一级
     void goUp();
+    // 把键盘焦点交给当前显示方式对应的文件区视图(缩略图/图标/列表/详细),这样方向键才能选文件。
+    // 从查看窗口返回、程序刚启动、上一级之后都要调这个,不要直接对 BrowserWidget 本身 setFocus(没用)。
+    void focusFileArea();
     // 全选
     void selectAll();
     // 打开当前项(文件夹则进入,图片则发 imageActivated)

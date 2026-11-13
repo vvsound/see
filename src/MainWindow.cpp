@@ -155,6 +155,7 @@ void MainWindow::startWith(const QStringList& paths)
         openPaths(paths, true);
         if (browser_->currentFolder().isEmpty()) browser_->openFolder(QDir::homePath());
     }
+    if (mode_ == WindowMode::Browser) browser_->focusFileArea();  // 否则刚启动时方向键选不了文件,要先点一下才行
     show();
 }
 
@@ -619,7 +620,7 @@ void MainWindow::setMode(WindowMode mode)
     updateTitle();
     if (mode == WindowMode::Browser) {
         updateBrowserStatus();
-        browser_->setFocus();
+        browser_->focusFileArea();  // 浏览窗口本身 setFocus 没用,方向键选文件要靠里面真正的视图拿到焦点
     } else {
         viewer_->setFocus();
     }
