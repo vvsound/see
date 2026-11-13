@@ -14,6 +14,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QWheelEvent>
 #include <QItemSelectionModel>
 #include <QDesktopServices>
 #include <QUrl>
@@ -571,6 +572,24 @@ void BrowserWidget::restoreLayout()
 // 事件过滤:右键时先选中光标下的项
 bool BrowserWidget::eventFilter(QObject* obj, QEvent* e)
 {
+    // Ctrl+滚轮:缩略图方式下放大/缩小缩略图(每格 16 像素,范围 32~256)
+    if (e->type() == QEvent::Wheel && obj == listView_->viewport()
+        && (mode_ == ViewMode::ThumbInfo || mode_ == ViewMode::Thumbs)) {
+        QWheelEvent* we = static_cast<QWheelEvent*>(e);
+        if ((we->modifiers() & Qt::ControlModifier) != 0 && we->angleDelta().y() != 0) {
+            Config& cfg = Config::instance();
+            const int cur = cfg.getInt(QStringLiteral("Thumbnails/Width"));
+            const int next = std::max(32, std::min(256, cur + (we->angleDelta().y() > 0 ? 16 : -16)));
+            if (next != cur) {
+                cfg.setInt(QStringLiteral("Thumbnails/Width"), next);
+                cfg.setInt(QStringLiteral("Thumbnails/Height"), next);
+                ThumbnailCache::instance().configure();
+                configureListView();
+                listView_->viewport()->update();
+            }
+            return true;
+        }
+    }
     if (e->type() == QEvent::MouseButtonPress) {
         QMouseEvent* me = static_cast<QMouseEvent*>(e);
         if (me->button() == Qt::RightButton) {

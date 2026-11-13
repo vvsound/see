@@ -15,7 +15,7 @@ jobs:
       - run: |
           New-Item -ItemType Directory dist
           Copy-Item build\QuickView.exe dist\
-          windeployqt --release dist\QuickView.exe
+          windeployqt --release --no-compiler-runtime dist\QuickView.exe
       - uses: actions/upload-artifact@v4
         with:
           name: QuickView-win64
