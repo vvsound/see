@@ -1,0 +1,46 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="QuickView.default.ini">QuickView.default.ini</file>
+    <file alias="lang/zh-CN.ini">../lang/zh-CN.ini</file>
+    <file alias="icons/about.svg">icons/about.svg</file>
+    <file alias="icons/actual.svg">icons/actual.svg</file>
+    <file alias="icons/assoc.svg">icons/assoc.svg</file>
+    <file alias="icons/back.svg">icons/back.svg</file>
+    <file alias="icons/copy.svg">icons/copy.svg</file>
+    <file alias="icons/copyto.svg">icons/copyto.svg</file>
+    <file alias="icons/delete.svg">icons/delete.svg</file>
+    <file alias="icons/exit.svg">icons/exit.svg</file>
+    <file alias="icons/extensions.svg">icons/extensions.svg</file>
+    <file alias="icons/first.svg">icons/first.svg</file>
+    <file alias="icons/fit.svg">icons/fit.svg</file>
+    <file alias="icons/fullscreen.svg">icons/fullscreen.svg</file>
+    <file alias="icons/last.svg">icons/last.svg</file>
+    <file alias="icons/moveto.svg">icons/moveto.svg</file>
+    <file alias="icons/next.svg">icons/next.svg</file>
+    <file alias="icons/ontop.svg">icons/ontop.svg</file>
+    <file alias="icons/open.svg">icons/open.svg</file>
+    <file alias="icons/options.svg">icons/options.svg</file>
+    <file alias="icons/prev.svg">icons/prev.svg</file>
+    <file alias="icons/print.svg">icons/print.svg</file>
+    <file alias="icons/properties.svg">icons/properties.svg</file>
+    <file alias="icons/refresh.svg">icons/refresh.svg</file>
+    <file alias="icons/rename.svg">icons/rename.svg</file>
+    <file alias="icons/rotl.svg">icons/rotl.svg</file>
+    <file alias="icons/rotr.svg">icons/rotr.svg</file>
+    <file alias="icons/selectall.svg">icons/selectall.svg</file>
+    <file alias="icons/toggle_menu.svg">icons/toggle_menu.svg</file>
+    <file alias="icons/toggle_pathbar.svg">icons/toggle_pathbar.svg</file>
+    <file alias="icons/toggle_preview.svg">icons/toggle_preview.svg</file>
+    <file alias="icons/toggle_statusbar.svg">icons/toggle_statusbar.svg</file>
+    <file alias="icons/toggle_toolbar.svg">icons/toggle_toolbar.svg</file>
+    <file alias="icons/toggle_tree.svg">icons/toggle_tree.svg</file>
+    <file alias="icons/up.svg">icons/up.svg</file>
+    <file alias="icons/view_details.svg">icons/view_details.svg</file>
+    <file alias="icons/view_icons.svg">icons/view_icons.svg</file>
+    <file alias="icons/view_list.svg">icons/view_list.svg</file>
+    <file alias="icons/view_thumbinfo.svg">icons/view_thumbinfo.svg</file>
+    <file alias="icons/view_thumbs.svg">icons/view_thumbs.svg</file>
+    <file alias="icons/zoomin.svg">icons/zoomin.svg</file>
+    <file alias="icons/zoomout.svg">icons/zoomout.svg</file>
+  </qresource>
+</RCC>
