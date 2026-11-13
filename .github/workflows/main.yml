@@ -1,0 +1,22 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.5.3'
+          arch: 'win64_msvc2019_64'
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build
+      - run: |
+          New-Item -ItemType Directory dist
+          Copy-Item build\QuickView.exe dist\
+          windeployqt --release dist\QuickView.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QuickView-win64
+          path: dist
