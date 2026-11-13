@@ -33,6 +33,7 @@
 #include "core/State.h"
 #include "core/Strings.h"
 #include "core/Commands.h"
+#include "core/CustomCommands.h"
 #include "core/FileOps.h"
 #include "core/DescriptIon.h"
 #include "core/ThumbnailCache.h"
@@ -465,6 +466,41 @@ void MainWindow::registerHandlers()
         viewer_->setZoomLock(v);
     });
     c.setHandler(QStringLiteral("RotateBy"), [this]() { cmdRotateBy(); });
+
+    // 自定义命令:个数不限,统一走 runCustomCommand
+    const QStringList all = c.ids();
+    for (int i = 0; i < all.size(); ++i) {
+        const QString id = all.at(i);
+        if (CustomCommands::instance().has(id)) {
+            c.setHandler(id, [this, id]() { runCustomCommand(id); });
+        }
+    }
+}
+
+// 运行一条自定义命令:{file}=当前图片(浏览窗口=当前文件)  {folder}=当前文件夹  {selected}=选中的全部文件
+void MainWindow::runCustomCommand(const QString& id)
+{
+    QString file;
+    QString folder;
+    const QStringList sel = targetPaths();
+    if (mode_ == WindowMode::Viewer) {
+        file = currentPath_;
+        if (!file.isEmpty()) folder = QFileInfo(file).absolutePath();
+    } else {
+        file = browser_->currentFilePath();
+        if (file.isEmpty() && !sel.isEmpty()) file = sel.first();
+        folder = browser_->folderList()->folder();
+    }
+    QString program;
+    QStringList args;
+    QString error;
+    if (!CustomCommands::instance().build(id, file, folder, sel, &program, &args, &error)) {
+        showError(error);
+        return;
+    }
+    if (!QProcess::startDetached(program, args, folder)) {
+        showError(QStringLiteral("无法运行 %1(命令 %2)。请检查 custom_commands.ini 里的 Program 是否写对。").arg(program).arg(id));
+    }
 }
 
 // 按 [MenuBrowser]/[MenuViewer] 重建菜单栏
@@ -511,7 +547,7 @@ void MainWindow::rebuildToolbar()
         }
         if (!cmds.has(id)) Config::fatal(S("err.unknownCommand").arg(id).arg(key));
         QAction* a = cmds.action(id);
-        QString tip = S(QStringLiteral("tip.") + id);
+        QString tip = cmds.tipOf(id);
         const QString keys = a->shortcut().toString(QKeySequence::NativeText);
         if (!keys.isEmpty()) tip += QStringLiteral(" (") + keys + QStringLiteral(")");
         a->setToolTip(tip);

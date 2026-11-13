@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QCoreApplication>
 #include <QStringList>
 #include <QString>
 
@@ -9,12 +10,25 @@
 #include "core/Commands.h"
 #include "core/ImageLoader.h"
 #include "core/SingleInstance.h"
+#include "core/Cli.h"
+#include "core/Theme.h"
+#include "core/CustomCommands.h"
 
 // 程序入口:启动顺序见 PROGRESS.md 第 9 条
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("QuickView"));
+    // 图片格式插件:除了 Qt 自带位置,也认 exe 旁边的 imageformats\ 文件夹(放入插件 dll 即可支持新格式,不用重新编译)
+    QCoreApplication::addLibraryPath(app.applicationDirPath());
+
+    // 命令行小工具(给 MoonManager 用),不启动界面
+    {
+        const QStringList a = app.arguments();
+        if (a.size() >= 2 && Cli::isToolOption(a.at(1))) {
+            return Cli::runTool(a.at(1));
+        }
+    }
 
     QString error;
     if (!Strings::instance().load(&error)) {
@@ -24,6 +38,9 @@ int main(int argc, char* argv[])
         Config::fatal(error);
     }
     if (!Config::instance().load(&error)) {
+        Config::fatal(error);
+    }
+    if (!Theme::apply(&error)) {
         Config::fatal(error);
     }
     State::instance().load();
@@ -48,6 +65,9 @@ int main(int argc, char* argv[])
     }
 
     Commands::instance().registerDefaults();
+    if (!CustomCommands::instance().load(&error)) {
+        Config::fatal(error);
+    }
     Commands::instance().createActions(&app);
     ImageLoader::instance().registerDefaults();
 

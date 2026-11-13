@@ -1,4 +1,6 @@
 #include "BrowserWidget.h"
+
+#include <QStyle>
 #include "core/Config.h"
 #include "core/State.h"
 #include "core/Strings.h"
@@ -375,9 +377,11 @@ void BrowserWidget::applyOptions()
                                                    ? QAbstractItemView::SelectRows : QAbstractItemView::SelectItems;
     detailView_->setSelectionBehavior(beh);
     detailView_->setAllColumnsShowFocus(cfg.getBool(QStringLiteral("FileList/FullRowSelect")));
-    detailView_->setStyleSheet(cfg.getBool(QStringLiteral("FileList/ShowGrid"))
-        ? QStringLiteral("QTreeView::item { border-right: 1px solid #d0d0d0; border-bottom: 1px solid #d0d0d0; }")
-        : QString());
+    // 网格线的样子由主题(theme\current.qss)里的 QTreeView[showGrid="true"]::item 决定,这里只告诉它开没开
+    detailView_->setProperty("showGrid", cfg.getBool(QStringLiteral("FileList/ShowGrid")));
+    detailView_->style()->unpolish(detailView_);
+    detailView_->style()->polish(detailView_);
+    detailView_->update();
     const bool autoW = cfg.getBool(QStringLiteral("FileList/AutoColumnWidth"));
     for (int i = 0; i < 3; ++i) {
         detailView_->header()->setSectionResizeMode(i, autoW ? QHeaderView::ResizeToContents : QHeaderView::Interactive);

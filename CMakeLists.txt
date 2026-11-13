@@ -35,6 +35,12 @@ set(QV_SOURCES
     src/core/ThumbnailCache.cpp
     src/core/SingleInstance.h
     src/core/SingleInstance.cpp
+    src/core/Cli.h
+    src/core/Cli.cpp
+    src/core/Theme.h
+    src/core/Theme.cpp
+    src/core/CustomCommands.h
+    src/core/CustomCommands.cpp
     src/ui/ViewerWidget.h
     src/ui/ViewerWidget.cpp
     src/ui/BrowserWidget.h

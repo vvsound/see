@@ -1,5 +1,6 @@
 #include "Config.h"
 #include "Strings.h"
+#include "Cli.h"
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -29,9 +30,28 @@ QString Config::iniPath()
     return appDir() + QStringLiteral("/QuickView.ini");
 }
 
+static bool g_cliMode = false;
+
+// 命令行小工具模式开关
+void Config::setCliMode(bool on)
+{
+    g_cliMode = on;
+}
+
+// 键所在的行号
+int Config::lineNumber(const QString& key) const
+{
+    if (!index_.contains(key)) return 0;
+    return index_.value(key) + 1;
+}
+
 // 显示错误对话框并立刻退出程序
 void Config::fatal(const QString& message)
 {
+    if (g_cliMode) {
+        Cli::write(message, true);
+        std::exit(1);
+    }
     if (qobject_cast<QApplication*>(QCoreApplication::instance()) != nullptr) {
         QMessageBox::critical(nullptr, QStringLiteral("QuickView"), message);
     } else {

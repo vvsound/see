@@ -21,6 +21,8 @@ struct CommandDef {
     QString iconFile;     // 图标文件名,在 resources/icons/ 下,如 next.svg;空表示无图标
     bool checkable;       // 是否可勾选
     CmdScope scope;       // 适用的窗口模式
+    bool custom = false;  // 是否自定义命令(来自 custom_commands.ini;名称/快捷键不走语言文件和 [Keys])
+    QString displayName;  // 自定义命令的显示名(内置命令为空,用 nameKey)
 };
 
 // 命令注册表:菜单、工具栏、快捷键、右键菜单都由它和配置生成
@@ -53,6 +55,10 @@ public:
     QIcon iconFor(const QString& id) const;
     // 命令的显示名称
     QString nameOf(const QString& id) const;
+    // 命令的工具提示文字(内置:lang 的 tip.ID;自定义:显示名)
+    QString tipOf(const QString& id) const;
+    // 适用窗口的名字:Browser / Viewer / Both
+    static QString scopeName(CmdScope scope);
     // 把 "Ctrl+O,F2" 解析成快捷键列表;写错会 fatal 并指出命令 ID
     QList<QKeySequence> parseKeys(const QString& id, const QString& text) const;
 

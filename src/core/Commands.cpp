@@ -187,11 +187,12 @@ void Commands::createActions(QObject* parent)
         const CommandDef& d = defs_.at(i);
         if (actions_.contains(d.id)) continue;
         QAction* a = new QAction(parent);
-        a->setText(S(d.nameKey));
+        a->setText(d.custom ? d.displayName : S(d.nameKey));
         a->setData(d.id);
         a->setCheckable(d.checkable);
         a->setIcon(iconFor(d.id));
-        a->setShortcuts(parseKeys(d.id, Config::instance().getString(QStringLiteral("Keys/") + d.id)));
+        a->setShortcuts(parseKeys(d.id, d.custom ? d.defaultKeys
+                                              : Config::instance().getString(QStringLiteral("Keys/") + d.id)));
         a->setShortcutContext(Qt::WindowShortcut);
         a->setIconVisibleInMenu(false);
         connect(a, SIGNAL(triggered()), this, SLOT(onActionTriggered()));
@@ -289,5 +290,24 @@ QIcon Commands::iconFor(const QString& id) const
 // 命令显示名
 QString Commands::nameOf(const QString& id) const
 {
-    return S(def(id).nameKey);
+    const CommandDef d = def(id);
+    return d.custom ? d.displayName : S(d.nameKey);
+}
+
+// 命令的工具提示文字
+QString Commands::tipOf(const QString& id) const
+{
+    const CommandDef d = def(id);
+    return d.custom ? d.displayName : S(QStringLiteral("tip.") + id);
+}
+
+// 适用窗口的名字
+QString Commands::scopeName(CmdScope scope)
+{
+    switch (scope) {
+    case CmdScope::Browser: return QStringLiteral("Browser");
+    case CmdScope::Viewer: return QStringLiteral("Viewer");
+    case CmdScope::Both: return QStringLiteral("Both");
+    }
+    return QString();
 }

@@ -60,6 +60,8 @@ private slots:
 private:
     // 注册所有命令的处理函数
     void registerHandlers();
+    // 运行一条自定义命令
+    void runCustomCommand(const QString& id);
     // 按 [MenuBrowser]/[MenuViewer] 配置重建菜单栏
     void rebuildMenus();
     // 按 [Toolbar] 配置重建工具栏

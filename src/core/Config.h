@@ -28,6 +28,10 @@ public:
     static QString iniPath();
     // 显示错误对话框并立刻退出程序(不兜底)
     static void fatal(const QString& message);
+    // 命令行小工具模式:fatal 不弹对话框,改为把错误写到标准错误后退出(退出码 1)
+    static void setCliMode(bool on);
+    // 某个键在用户 ini 里的行号(1 起);不存在返回 0
+    int lineNumber(const QString& key) const;
 
     // 首次运行:ini 不存在则用内置模板生成
     bool ensureFileExists(QString* error);
