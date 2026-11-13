@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QMap>
 #include <QColor>
+#include "core/Types.h"
 #include "core/FolderList.h"
 #include "core/DescriptIon.h"
 #include <memory>
