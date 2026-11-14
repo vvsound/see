@@ -128,6 +128,8 @@ private:
     void cmdCopyImage();
     // 剪切文件到剪贴板
     void cmdCutFile();
+    void cmdPaste();
+    void cmdNewFolder();
     // 编辑文件描述(descript.ion)
     void cmdEditDescription();
     // 重新载入当前图(不用缓存)

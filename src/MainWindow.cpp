@@ -6,6 +6,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QMimeData>
+#include <QClipboard>
 #include <QUrl>
 #include <QMenuBar>
 #include <QMenu>
@@ -507,6 +508,9 @@ void MainWindow::registerHandlers()
     c.setHandler(QStringLiteral("FileAssoc"), [this]() { cmdFileAssoc(); });
     c.setHandler(QStringLiteral("About"), [this]() { cmdAbout(); });
     c.setHandler(QStringLiteral("CutFile"), [this]() { cmdCutFile(); });
+    c.setHandler(QStringLiteral("Paste"), [this]() { cmdPaste(); });
+    c.setHandler(QStringLiteral("NewFolder"), [this]() { cmdNewFolder(); });
+    c.setHandler(QStringLiteral("ThumbReset"), [this]() { browser_->resetThumbSize(); });
     c.setHandler(QStringLiteral("CopyImageSel"), [this]() { cmdCopyImage(); });
     c.setHandler(QStringLiteral("EditDescription"), [this]() { cmdEditDescription(); });
     c.setHandler(QStringLiteral("ReloadImage"), [this]() { cmdReloadImage(); });
@@ -1164,6 +1168,54 @@ void MainWindow::cmdCopyImage()
     QImage img = r.image;
     if (mode_ == WindowMode::Viewer && viewer_->rotation() != 0) img = img.transformed(QTransform().rotate(viewer_->rotation()));
     FileOps::copyImageToClipboard(img);
+}
+
+// 粘贴:把剪贴板里的文件复制/移动到当前文件夹(重名按设置 Archive/DuplicateAction 处理)
+void MainWindow::cmdPaste()
+{
+    if (mode_ != WindowMode::Browser) return;
+    const QMimeData* md = QApplication::clipboard()->mimeData();
+    QStringList paths;
+    if (md != nullptr && md->hasUrls()) {
+        const QList<QUrl> urls = md->urls();
+        for (int i = 0; i < urls.size(); ++i) {
+            if (urls.at(i).isLocalFile()) paths << urls.at(i).toLocalFile();
+        }
+    }
+    if (paths.isEmpty()) {
+        showError(S("err.pasteEmpty"));
+        return;
+    }
+    const QByteArray effect = md->data(QStringLiteral("Preferred DropEffect"));
+    const bool move = !effect.isEmpty() && effect.at(0) == 2;  // 2 = 剪切
+    QString err;
+    if (!FileOps::copyOrMove(this, paths, browser_->currentFolder(), move, &err)) {
+        if (!err.isEmpty()) showError(err);
+        browser_->folderList()->refresh();
+        return;
+    }
+    if (move) QApplication::clipboard()->clear();
+    browser_->folderList()->refresh();
+}
+
+// 新建文件夹:在当前文件夹里建一个子文件夹
+void MainWindow::cmdNewFolder()
+{
+    if (mode_ != WindowMode::Browser) return;
+    bool ok = false;
+    const QString name = QInputDialog::getText(this, S("dlg.newfolder.title"), S("dlg.newfolder.label"), QLineEdit::Normal,
+                                               S("dlg.newfolder.default"), &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    QDir dir(browser_->currentFolder());
+    if (QFileInfo::exists(dir.absoluteFilePath(name))) {
+        showError(S("err.folderExists").arg(QDir::toNativeSeparators(dir.absoluteFilePath(name))));
+        return;
+    }
+    if (!dir.mkdir(name)) {
+        showError(S("err.mkdir").arg(QDir::toNativeSeparators(dir.absoluteFilePath(name))));
+        return;
+    }
+    browser_->refresh();
 }
 
 // 剪切文件到剪贴板

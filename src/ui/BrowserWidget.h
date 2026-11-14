@@ -67,6 +67,8 @@ public:
     bool goForward();
     // 缩略图放大(direction>0)/缩小(direction<0),步长和范围见 [Thumbnails] 设置;非缩略图方式不处理
     void adjustThumbSize(int direction);
+    // 恢复默认缩略图大小
+    void resetThumbSize();
     // 筛选条:向后/向前切换扩展名标签、回到"全部"、切换排序依据、反转排序方向、切换网格/列表(条被隐藏时什么也不做)
     void filterStep(int delta);
     void filterAll();
@@ -204,6 +206,8 @@ private:
     QTimer* previewTimer_;
     QTimer* treeTimer_;
     FocusArea focusArea_;
+    int wheelAcc_ = 0;  // Ctrl+滚轮累计量
+    void setThumbSize(int size);
     QStringList history_;         // 目录历史
     int histPos_;                 // 当前在历史里的位置
     bool navigatingHistory_;      // 正在按历史走(不再往历史里添加)

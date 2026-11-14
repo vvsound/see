@@ -1,5 +1,6 @@
 #include "BrowserWidget.h"
 
+#include <QKeyEvent>
 #include <QStyle>
 #include <QFocusEvent>
 #include "core/Config.h"
@@ -650,15 +651,27 @@ void BrowserWidget::restorePosition()
 }
 
 // 缩略图放大/缩小一步
+// 恢复默认缩略图大小(设置 Thumbnails/DefaultSize)
+void BrowserWidget::resetThumbSize()
+{
+    setThumbSize(Config::instance().getInt(QStringLiteral("Thumbnails/DefaultSize")));
+}
+
 void BrowserWidget::adjustThumbSize(int direction)
+{
+    Config& c0 = Config::instance();
+    const int step = c0.getInt(QStringLiteral("Thumbnails/SizeStep"));
+    setThumbSize(c0.getInt(QStringLiteral("Thumbnails/Width")) + (direction > 0 ? step : -step));
+}
+
+void BrowserWidget::setThumbSize(int size)
 {
     if (mode_ != ViewMode::ThumbInfo && mode_ != ViewMode::Thumbs) return;
     Config& cfg = Config::instance();
-    const int step = cfg.getInt(QStringLiteral("Thumbnails/SizeStep"));
     const int lo = cfg.getInt(QStringLiteral("Thumbnails/MinSize"));
     const int hi = cfg.getInt(QStringLiteral("Thumbnails/MaxSize"));
     const int cur = cfg.getInt(QStringLiteral("Thumbnails/Width"));
-    const int next = std::max(lo, std::min(hi, cur + (direction > 0 ? step : -step)));
+    const int next = std::max(lo, std::min(hi, size));
     if (next == cur) return;
     cfg.setInt(QStringLiteral("Thumbnails/Width"), next);
     cfg.setInt(QStringLiteral("Thumbnails/Height"), next);
@@ -959,12 +972,45 @@ bool BrowserWidget::eventFilter(QObject* obj, QEvent* e)
             return QWidget::eventFilter(obj, e);
         }
     }
-    // Ctrl+滚轮:缩略图方式下放大/缩小缩略图(步长和范围见 [Thumbnails])
-    if (e->type() == QEvent::Wheel && obj == listView_->viewport()
+    // 只用方向键走遍全程:缩略图最左一列按 ←  → 回文件夹树;树里没有子文件夹时按 → 进入缩略图区
+    if (e->type() == QEvent::KeyPress) {
+        QKeyEvent* ke = static_cast<QKeyEvent*>(e);
+        const Qt::KeyboardModifiers mods = ke->modifiers() & ~Qt::KeypadModifier;
+        if (mods == Qt::NoModifier) {
+            Config& cfg = Config::instance();
+            if (obj == tree_ && ke->key() == Qt::Key_Right && cfg.getBool(QStringLiteral("Browse/RightToFiles"))) {
+                const QModelIndex idx = tree_->currentIndex();
+                if (idx.isValid() && treeModel_->rowCount(idx) == 0) {
+                    activateTreeItem();  // 载入该文件夹并把焦点交给缩略图区
+                    return true;
+                }
+            }
+            if ((obj == listView_ || obj == detailView_) && ke->key() == Qt::Key_Left && treeVisible_
+                && cfg.getBool(QStringLiteral("Browse/LeftToTree"))) {
+                QAbstractItemView* v = static_cast<QAbstractItemView*>(obj);
+                const QModelIndex cur = v->currentIndex();
+                bool edge = true;
+                if (obj == listView_ && cur.isValid() && cur.row() > 0) {
+                    const QModelIndex first = v->model()->index(0, 0);
+                    edge = v->visualRect(cur).left() <= v->visualRect(first).left() + 1;
+                }
+                if (edge) {
+                    focusTree();
+                    return true;
+                }
+            }
+        }
+    }
+    // Ctrl+滚轮:缩略图方式下放大/缩小缩略图(步长和范围见 [Thumbnails]);按滚轮累计量算格,触摸板也行
+    if (e->type() == QEvent::Wheel && (obj == listView_->viewport() || obj == listView_)
         && (mode_ == ViewMode::ThumbInfo || mode_ == ViewMode::Thumbs)) {
         QWheelEvent* we = static_cast<QWheelEvent*>(e);
-        if ((we->modifiers() & Qt::ControlModifier) != 0 && we->angleDelta().y() != 0) {
-            adjustThumbSize(we->angleDelta().y() > 0 ? 1 : -1);
+        if ((we->modifiers() & Qt::ControlModifier) != 0) {
+            int dy = we->angleDelta().y();
+            if (dy == 0) dy = we->angleDelta().x();
+            wheelAcc_ += dy;
+            while (wheelAcc_ >= 120) { adjustThumbSize(1); wheelAcc_ -= 120; }
+            while (wheelAcc_ <= -120) { adjustThumbSize(-1); wheelAcc_ += 120; }
             return true;
         }
     }
