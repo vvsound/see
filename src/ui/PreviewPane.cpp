@@ -53,6 +53,7 @@ void PreviewPane::applyOptions()
     autoPreview_ = c.getBool(QStringLiteral("FileList/PreviewAuto"));
     delayMs_ = c.getInt(QStringLiteral("FileList/PreviewDelayMs"));
     if (!autoPreview_) clear();
+    update();
 }
 
 // 绘制:居中等比缩放;失败时画错误文字
@@ -62,7 +63,7 @@ void PreviewPane::paintEvent(QPaintEvent* e)
     QPainter p(this);
     p.fillRect(rect(), palette().base());
     if (!error_.isEmpty()) {
-        p.setPen(QColor(180, 40, 40));
+        p.setPen(Config::instance().getColor(QStringLiteral("Info/PreviewErrorColor")));
         p.drawText(rect().adjusted(6, 6, -6, -6), Qt::AlignCenter | Qt::TextWordWrap, error_);
         return;
     }

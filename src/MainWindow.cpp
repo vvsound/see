@@ -110,7 +110,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     hideCursorTimer_ = new QTimer(this);
     hideCursorTimer_->setSingleShot(true);
-    hideCursorTimer_->setInterval(2000);
+    hideCursorTimer_->setInterval(Config::instance().getInt(QStringLiteral("Viewer/HideMouseDelayMs")));
     connect(hideCursorTimer_, &QTimer::timeout, this, &MainWindow::onHideCursorTimer);
 
     settleTimer_ = new QTimer(this);
@@ -394,6 +394,7 @@ void MainWindow::onHideCursorTimer()
 void MainWindow::onOptionsApplied()
 {
     viewer_->applyOptions();
+    hideCursorTimer_->setInterval(Config::instance().getInt(QStringLiteral("Viewer/HideMouseDelayMs")));
     browser_->applyOptions();
     applyVisibility();
     syncCheckStates();
@@ -682,9 +683,9 @@ void MainWindow::buildStatusBar()
         bar->addWidget(statusLabels_[1], 0);
         bar->addWidget(statusLabels_[2], hints ? 0 : 1);
         bar->addWidget(statusLabels_[3], 0);
-        statusLabels_[0]->setMinimumWidth(170);
-        statusLabels_[1]->setMinimumWidth(190);
-        statusLabels_[3]->setMinimumWidth(190);
+        statusLabels_[0]->setMinimumWidth(Config::instance().getInt(QStringLiteral("StatusBar/BrowserTotalWidth")));
+        statusLabels_[1]->setMinimumWidth(Config::instance().getInt(QStringLiteral("StatusBar/BrowserSelectionWidth")));
+        statusLabels_[3]->setMinimumWidth(Config::instance().getInt(QStringLiteral("StatusBar/BrowserImageInfoWidth")));
         statusLabels_[0]->show();
         statusLabels_[1]->show();
         statusLabels_[2]->show();
@@ -697,12 +698,12 @@ void MainWindow::buildStatusBar()
         bar->addWidget(statusLabels_[3], 0);
         bar->addWidget(statusLabels_[4], 0);
         bar->addWidget(statusLabels_[5], 0);
-        statusLabels_[0]->setMinimumWidth(70);
+        statusLabels_[0]->setMinimumWidth(Config::instance().getInt(QStringLiteral("StatusBar/ViewerIndexWidth")));
         statusLabels_[1]->setMinimumWidth(0);
-        statusLabels_[2]->setMinimumWidth(80);
-        statusLabels_[3]->setMinimumWidth(190);
-        statusLabels_[4]->setMinimumWidth(60);
-        statusLabels_[5]->setMinimumWidth(110);
+        statusLabels_[2]->setMinimumWidth(Config::instance().getInt(QStringLiteral("StatusBar/ViewerSizeWidth")));
+        statusLabels_[3]->setMinimumWidth(Config::instance().getInt(QStringLiteral("StatusBar/ViewerImageInfoWidth")));
+        statusLabels_[4]->setMinimumWidth(Config::instance().getInt(QStringLiteral("StatusBar/ViewerZoomWidth")));
+        statusLabels_[5]->setMinimumWidth(Config::instance().getInt(QStringLiteral("StatusBar/ViewerLoadTimeWidth")));
         for (int i = 0; i < 6; ++i) statusLabels_[i]->show();
     }
 }

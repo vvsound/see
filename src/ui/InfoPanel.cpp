@@ -98,8 +98,13 @@ void HistogramWidget::paintEvent(QPaintEvent*)
     p.drawRect(rect().adjusted(0, 0, -1, -1));
     if (!has_ || peak_ <= 0) return;
     const QRectF area = QRectF(rect()).adjusted(2, 2, -2, -2);
-    const QColor colors[4] = { QColor(230, 70, 70, 120), QColor(70, 200, 90, 120), QColor(80, 130, 240, 120),
-                               palette().text().color() };
+    Config& hc = Config::instance();
+    const int ha = hc.getInt(QStringLiteral("Info/HistogramAlpha"));
+    QColor cr = hc.getColor(QStringLiteral("Info/HistogramRed"));
+    QColor cg = hc.getColor(QStringLiteral("Info/HistogramGreen"));
+    QColor cb = hc.getColor(QStringLiteral("Info/HistogramBlue"));
+    cr.setAlpha(ha); cg.setAlpha(ha); cb.setAlpha(ha);
+    const QColor colors[4] = { cr, cg, cb, palette().text().color() };
     p.setRenderHint(QPainter::Antialiasing, true);
     for (int c = 0; c < 4; ++c) {
         QPainterPath path;
@@ -186,6 +191,7 @@ void InfoPanel::applyOptions()
     histTitle_->setVisible(hist);
     hist_->setVisible(hist);
     hist_->setFixedHeight(cfg.getInt(QStringLiteral("Info/HistogramHeight")));
+    hist_->update();
     fieldList(QStringLiteral("Info/BasicFields"), kBasicFields, int(sizeof(kBasicFields) / sizeof(kBasicFields[0])));
     fieldList(QStringLiteral("Info/ExifFields"), kExifFields, int(sizeof(kExifFields) / sizeof(kExifFields[0])));
     const QString p = path_;

@@ -123,8 +123,8 @@ double ViewerWidget::zoom() const
 void ViewerWidget::setZoom(double z, const QPointF& anchor, bool useAnchor)
 {
     if (!hasImage()) return;
-    if (z < 0.01) z = 0.01;
-    if (z > 64.0) z = 64.0;
+    if (z < zoomMin_) z = zoomMin_;
+    if (z > zoomMax_) z = zoomMax_;
     const QPointF c(width() / 2.0, height() / 2.0);
     const QPointF a = useAnchor ? anchor : c;
     const QPointF p = (a - (c + offset_)) / zoom_;  // 锚点下的图片内位置(相对图片中心)
@@ -139,13 +139,13 @@ void ViewerWidget::setZoom(double z, const QPointF& anchor, bool useAnchor)
 // 放大一档(以窗口中心为中心);TODO-CONFIRM:每档倍率
 void ViewerWidget::zoomIn()
 {
-    setZoom(zoom_ * 1.25, QPointF(), false);
+    setZoom(zoom_ * zoomStep_, QPointF(), false);
 }
 
 // 缩小一档
 void ViewerWidget::zoomOut()
 {
-    setZoom(zoom_ / 1.25, QPointF(), false);
+    setZoom(zoom_ / zoomStep_, QPointF(), false);
 }
 
 // 适应窗口(大图缩小、小图不放大,除非选项要求放大)
@@ -212,6 +212,12 @@ QSize ViewerWidget::displaySizeAt100() const
 void ViewerWidget::applyOptions()
 {
     Config& cfg = Config::instance();
+    zoomStep_ = cfg.getDouble(QStringLiteral("Viewer/ZoomStep"));
+    zoomMin_ = cfg.getDouble(QStringLiteral("Viewer/ZoomMin"));
+    zoomMax_ = cfg.getDouble(QStringLiteral("Viewer/ZoomMax"));
+    if (zoomMax_ < zoomMin_) zoomMax_ = zoomMin_;
+    bgColor_ = cfg.getColor(QStringLiteral("Viewer/BackgroundColor"));
+    errColor_ = cfg.getColor(QStringLiteral("Viewer/ErrorTextColor"));
     shrinkToWindow_ = cfg.getBool(QStringLiteral("Viewer/ShrinkToWindow"));
     shrinkToScreen_ = cfg.getBool(QStringLiteral("Viewer/ShrinkToScreen"));
     enlargeToWindow_ = cfg.getBool(QStringLiteral("Viewer/EnlargeToWindow"));
@@ -279,9 +285,9 @@ void ViewerWidget::paintEvent(QPaintEvent* e)
 {
     Q_UNUSED(e);
     QPainter p(this);
-    p.fillRect(rect(), QColor(0x20, 0x20, 0x20));  // TODO-CONFIRM:背景色
+    p.fillRect(rect(), bgColor_);
     if (!errorText_.isEmpty()) {
-        p.setPen(QColor(0xFF, 0xA0, 0xA0));
+        p.setPen(errColor_);
         p.drawText(rect().adjusted(24, 24, -24, -24), Qt::AlignCenter | Qt::TextWordWrap, errorText_);
         return;
     }
@@ -311,9 +317,9 @@ void ViewerWidget::wheelEvent(QWheelEvent* e)
                         + QString::fromLatin1(dy > 0 ? "Up" : "Down");
     const QString v = Config::instance().getString(key);
     if (v == QLatin1String("ZoomIn")) {
-        setZoom(zoom_ * 1.25, e->position(), true);
+        setZoom(zoom_ * zoomStep_, e->position(), true);
     } else if (v == QLatin1String("ZoomOut")) {
-        setZoom(zoom_ / 1.25, e->position(), true);
+        setZoom(zoom_ / zoomStep_, e->position(), true);
     } else {
         dispatchMouse(key);
     }

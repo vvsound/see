@@ -1,5 +1,6 @@
 #pragma once
 #include <QWidget>
+#include <QColor>
 #include <QImage>
 #include <QPointF>
 #include <QPoint>
@@ -107,6 +108,8 @@ private:
     QPoint lastMouse_;
     bool gammaEnabled_;
     double gamma_;
+    double zoomStep_, zoomMin_, zoomMax_;   // 每档倍率、缩放下限、上限(Viewer/Zoom*)
+    QColor bgColor_, errColor_;             // 背景色、错误文字色(Viewer/BackgroundColor、ErrorTextColor)
     bool disableAnimation_;
     bool shrinkToWindow_;
     bool enlargeToWindow_;

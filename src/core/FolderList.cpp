@@ -37,7 +37,7 @@ FolderList::FolderList(QObject* parent) : QObject(parent)
     watcher_ = new QFileSystemWatcher(this);
     refreshTimer_ = new QTimer(this);
     refreshTimer_->setSingleShot(true);
-    refreshTimer_->setInterval(300);
+    refreshTimer_->setInterval(Config::instance().getInt(QStringLiteral("Browse/AutoRefreshDelayMs")));
     connect(watcher_, &QFileSystemWatcher::directoryChanged, this, &FolderList::onDirectoryChanged);
     connect(refreshTimer_, &QTimer::timeout, this, &FolderList::onRefreshTimer);
 }
