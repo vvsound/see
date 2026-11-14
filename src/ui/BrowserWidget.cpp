@@ -145,10 +145,21 @@ public:
             painter->drawText(imgArea, Qt::AlignCenter, err.isEmpty() ? QStringLiteral("...") : QStringLiteral("x"));
         } else {
             const QIcon ic = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
-            const int side = qMin(48, qMin(imgArea.width(), imgArea.height()));
+            // 仅缩略图方式没有文字行:文件夹/\"..\"/其他文件的名字画在格子下部,否则分不出是哪个
+            const int nlh = QFontMetrics(option.font).height();
+            QRect iconArea = imgArea;
+            if (!withText_) iconArea.setBottom(iconArea.bottom() - nlh - 2);
+            const int side = qMin(48, qMin(iconArea.width(), iconArea.height()));
             QRect ir(0, 0, side, side);
-            ir.moveCenter(imgArea.center());
+            ir.moveCenter(iconArea.center());
             ic.paint(painter, ir);
+            if (!withText_) {
+                painter->setFont(option.font);
+                painter->setPen(textColor_);
+                const QRect nr(cell.left() + 2, imgArea.bottom() - nlh, cell.width() - 4, nlh);
+                painter->drawText(nr, Qt::AlignHCenter | Qt::AlignVCenter,
+                                  QFontMetrics(option.font).elidedText(index.data(Qt::DisplayRole).toString(), Qt::ElideMiddle, nr.width()));
+            }
         }
         if (withText_) {
             const QFontMetrics fm(option.font);
