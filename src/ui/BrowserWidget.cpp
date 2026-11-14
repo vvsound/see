@@ -419,8 +419,8 @@ void BrowserWidget::setViewMode(ViewMode mode)
     const QStringList sel = selectedPaths();
     const QString cur = currentFilePath();
     mode_ = mode;
-    const bool thumbs = (mode == ViewMode::ThumbInfo || mode == ViewMode::Thumbs);
-    model_->setParentRowVisible(!thumbs);
+    // 所有显示方式都带 ".." 返回项(像 ACDSee:缩略图方式里它是第一格,双击回上一级)
+    model_->setParentRowVisible(true);
     model_->setViewMode(mode);
     if (mode == ViewMode::Details) {
         viewStack_->setCurrentWidget(detailView_);
@@ -643,7 +643,8 @@ void BrowserWidget::restorePosition()
         break;
     }
     if (!Config::instance().getBool(QStringLiteral("Browse/EnterSelectFirst"))) return;
-    const int row = model_->hasParentRow() ? 1 : 0;
+    int row = model_->hasParentRow() ? 1 : 0;
+    if (row >= model_->rowCount(QModelIndex())) row = 0;  // 文件夹里只有 ".." 时选中它,回车即可返回上一级
     if (row >= model_->rowCount(QModelIndex())) return;
     const QModelIndex idx = model_->index(row, 0);
     detailView_->selectionModel()->setCurrentIndex(idx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
