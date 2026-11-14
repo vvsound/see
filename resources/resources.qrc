@@ -3,6 +3,10 @@
     <file alias="QuickView.default.ini">QuickView.default.ini</file>
     <file alias="lang/zh-CN.ini">../lang/zh-CN.ini</file>
     <file alias="icons/info.svg">icons/info.svg</file>
+    <file alias="icons/toggle_info_preview.svg">icons/toggle_info_preview.svg</file>
+    <file alias="icons/toggle_info_basic.svg">icons/toggle_info_basic.svg</file>
+    <file alias="icons/toggle_info_exif.svg">icons/toggle_info_exif.svg</file>
+    <file alias="icons/toggle_info_histogram.svg">icons/toggle_info_histogram.svg</file>
     <file alias="icons/filter.svg">icons/filter.svg</file>
     <file alias="icons/sort.svg">icons/sort.svg</file>
     <file alias="icons/favorite.svg">icons/favorite.svg</file>

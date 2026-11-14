@@ -127,6 +127,17 @@ MainWindow::MainWindow(QWidget* parent)
         if (a != nullptr) addAction(a);
     }
     registerHandlers();
+    {   // 右侧信息面板顶部的 4 个图标开关(预览/基本信息/EXIF/直方图)
+        static const char* const kIds[] = {"ToggleInfoPreview", "ToggleInfoBasic", "ToggleInfoExif", "ToggleInfoHistogram"};
+        QList<QAction*> acts;
+        for (int i = 0; i < 4; ++i) {
+            const QString id = QLatin1String(kIds[i]);
+            QAction* a = cmds.action(id);
+            if (a != nullptr) a->setToolTip(cmds.tipOf(id));
+            acts.append(a);
+        }
+        browser_->infoPanel()->setToggleActions(acts);
+    }
     viewer_->setZoomLock(Config::instance().getBool(QStringLiteral("Viewer/ZoomLock")));
 
     connect(browser_, &BrowserWidget::imageActivated, this, &MainWindow::onBrowserImageActivated);
@@ -487,6 +498,19 @@ void MainWindow::registerHandlers()
         Config::instance().setBool(QStringLiteral("Browse/ShowInfoPanel"), Commands::instance().action(QStringLiteral("ToggleInfo"))->isChecked());
         applyVisibility();
     });
+    {   // 信息面板各部分的显示开关:改 [Info] 里对应的 ShowXxx,并立刻刷新面板
+        static const char* const kInfoToggles[][2] = {
+            {"ToggleInfoPreview", "Info/ShowPreview"}, {"ToggleInfoBasic", "Info/ShowBasic"},
+            {"ToggleInfoExif", "Info/ShowExif"}, {"ToggleInfoHistogram", "Info/ShowHistogram"}};
+        for (int i = 0; i < 4; ++i) {
+            const QString id = QLatin1String(kInfoToggles[i][0]);
+            const QString key = QLatin1String(kInfoToggles[i][1]);
+            c.setHandler(id, [this, id, key]() {
+                Config::instance().setBool(key, Commands::instance().action(id)->isChecked());
+                browser_->infoPanel()->applyOptions();
+            });
+        }
+    }
     c.setHandler(QStringLiteral("TogglePathBar"), [this]() {
         Config::instance().setBool(QStringLiteral("Browse/ShowPathBar"), Commands::instance().action(QStringLiteral("TogglePathBar"))->isChecked());
         applyVisibility();
@@ -1403,6 +1427,10 @@ void MainWindow::syncCheckStates()
     c.action(QStringLiteral("ToggleTree"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowTree")));
     c.action(QStringLiteral("TogglePreview"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowPreview")));
     c.action(QStringLiteral("ToggleInfo"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowInfoPanel")));
+    c.action(QStringLiteral("ToggleInfoPreview"))->setChecked(cfg.getBool(QStringLiteral("Info/ShowPreview")));
+    c.action(QStringLiteral("ToggleInfoBasic"))->setChecked(cfg.getBool(QStringLiteral("Info/ShowBasic")));
+    c.action(QStringLiteral("ToggleInfoExif"))->setChecked(cfg.getBool(QStringLiteral("Info/ShowExif")));
+    c.action(QStringLiteral("ToggleInfoHistogram"))->setChecked(cfg.getBool(QStringLiteral("Info/ShowHistogram")));
     c.action(QStringLiteral("ToggleKeyHints"))->setChecked(hintsVisible());
     c.action(QStringLiteral("AlwaysOnTop"))->setChecked(cfg.getBool(QStringLiteral("Viewer/AlwaysOnTop")));
     c.action(QStringLiteral("Fullscreen"))->setChecked(fullscreen_);

@@ -6,6 +6,9 @@
 #include "core/ExifReader.h"
 
 #include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QToolButton>
+#include <QAction>
 #include <QPainter>
 #include <QPainterPath>
 #include <QFileInfo>
@@ -146,6 +149,28 @@ InfoPanel::InfoPanel(QWidget* parent) : QWidget(parent)
     lay->addStretch(1);
     connect(preview_, &PreviewPane::imageChanged, hist_, &HistogramWidget::setImage);
     applyOptions();
+}
+
+// 面板顶部的图标开关条
+void InfoPanel::setToggleActions(const QList<QAction*>& actions)
+{
+    QWidget* strip = new QWidget(this);
+    strip->setObjectName(QStringLiteral("infoToggles"));
+    QHBoxLayout* row = new QHBoxLayout(strip);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(4);
+    for (int i = 0; i < actions.size(); ++i) {
+        if (actions.at(i) == nullptr) continue;
+        QToolButton* b = new QToolButton(strip);
+        b->setDefaultAction(actions.at(i));
+        b->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        b->setAutoRaise(true);
+        b->setIconSize(QSize(16, 16));
+        b->setFocusPolicy(Qt::NoFocus);
+        row->addWidget(b);
+    }
+    row->addStretch(1);
+    static_cast<QVBoxLayout*>(layout())->insertWidget(0, strip);
 }
 
 // 重新读取 [Info] 设置并刷新当前内容

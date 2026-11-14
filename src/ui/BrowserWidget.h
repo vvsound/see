@@ -83,6 +83,8 @@ public:
     void startRename();
     // 文件夹列表对象(查看窗口翻页用)
     FolderList* folderList() const;
+    // 右侧信息面板(主窗口用它挂上“预览/基本信息/EXIF/直方图”的显示开关)
+    InfoPanel* infoPanel() const { return info_; }
     // 状态栏四个字段:总计、选中大小和时间、选中文件名、图片信息
     QStringList statusFields() const;
     // 设置各部件可见性(菜单"视图"里的开关)

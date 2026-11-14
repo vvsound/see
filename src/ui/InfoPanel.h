@@ -22,6 +22,8 @@ private:
     bool has_;
 };
 
+class QAction;
+
 // 浏览窗口右侧的信息面板:预览、基本信息、EXIF、直方图(各部分和字段由 [Info] 设置决定)
 class InfoPanel : public QWidget {
     Q_OBJECT
@@ -33,6 +35,8 @@ public:
     void clear();
     // 重新读取 [Info] 设置
     void applyOptions();
+    // 在面板顶部放一排图标开关(预览/基本信息/EXIF/直方图),由命令的 QAction 驱动
+    void setToggleActions(const QList<QAction*>& actions);
 
 private:
     // 生成基本信息 / EXIF 的 HTML 文字
