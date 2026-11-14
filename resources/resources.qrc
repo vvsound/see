@@ -2,6 +2,11 @@
   <qresource prefix="/">
     <file alias="QuickView.default.ini">QuickView.default.ini</file>
     <file alias="lang/zh-CN.ini">../lang/zh-CN.ini</file>
+    <file alias="icons/info.svg">icons/info.svg</file>
+    <file alias="icons/filter.svg">icons/filter.svg</file>
+    <file alias="icons/sort.svg">icons/sort.svg</file>
+    <file alias="icons/favorite.svg">icons/favorite.svg</file>
+    <file alias="icons/hint.svg">icons/hint.svg</file>
     <file alias="icons/about.svg">icons/about.svg</file>
     <file alias="icons/actual.svg">icons/actual.svg</file>
     <file alias="icons/assoc.svg">icons/assoc.svg</file>

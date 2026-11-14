@@ -28,6 +28,11 @@
 #include <QLineEdit>
 #include <QPainter>
 #include <functional>
+#include "core/Theme.h"
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <dwmapi.h>
+#endif
 
 #include "core/Config.h"
 #include "core/State.h"
@@ -84,6 +89,8 @@ MainWindow::MainWindow(QWidget* parent)
       mode_(WindowMode::Browser), currentIndex_(-1), fullscreen_(false), hideCursorTimer_(nullptr),
       browserMenuBarShown_(true)
 {
+    hintLabel_ = nullptr;
+    settleTimer_ = nullptr;
     for (int i = 0; i < 6; ++i) statusLabels_[i] = nullptr;
 
     stack_ = new QStackedWidget(this);
@@ -105,6 +112,10 @@ MainWindow::MainWindow(QWidget* parent)
     hideCursorTimer_->setInterval(2000);
     connect(hideCursorTimer_, &QTimer::timeout, this, &MainWindow::onHideCursorTimer);
 
+    settleTimer_ = new QTimer(this);
+    settleTimer_->setSingleShot(true);
+    connect(settleTimer_, &QTimer::timeout, this, [this]() { settleFlip(); });
+
     setAcceptDrops(true);
 
     // 所有命令的 action 都加到窗口上,这样菜单里没有的命令快捷键也有效
@@ -120,6 +131,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(browser_, &BrowserWidget::imageActivated, this, &MainWindow::onBrowserImageActivated);
     connect(browser_, &BrowserWidget::folderChanged, this, &MainWindow::onBrowserFolderChanged);
     connect(browser_, &BrowserWidget::selectionChanged, this, &MainWindow::onBrowserSelectionChanged);
+    connect(browser_, &BrowserWidget::focusAreaChanged, this, [this]() { updateHint(); });
     connect(browser_, &BrowserWidget::commandRequested, this, &MainWindow::onCommandRequested);
     connect(browser_, &BrowserWidget::contextMenuRequested, this, &MainWindow::onContextMenu);
     connect(viewer_, &ViewerWidget::zoomChanged, this, &MainWindow::onViewerZoomChanged);
@@ -135,6 +147,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     buildStatusBar();
     setMode(WindowMode::Browser);
+    applyTitleBar();
 }
 
 // 启动:命令行没有路径则打开最近文件夹;有路径则直接查看
@@ -298,6 +311,7 @@ void MainWindow::onCommandRequested(const QString& id)
 void MainWindow::onViewerZoomChanged(double zoom)
 {
     if (statusLabels_[4] != nullptr) statusLabels_[4]->setText(S("status.zoom").arg(qRound(zoom * 100.0)));
+    updateHint();
 }
 
 // 弹出右键菜单(内容来自 [ContextMenu])
@@ -417,6 +431,39 @@ void MainWindow::registerHandlers()
     c.setHandler(QStringLiteral("ViewThumbs"), [this]() { browser_->setViewMode(ViewMode::Thumbs); syncCheckStates(); updateBrowserStatus(); });
     c.setHandler(QStringLiteral("ViewIcons"), [this]() { browser_->setViewMode(ViewMode::Icons); syncCheckStates(); updateBrowserStatus(); });
     c.setHandler(QStringLiteral("ViewList"), [this]() { browser_->setViewMode(ViewMode::List); syncCheckStates(); updateBrowserStatus(); });
+    c.setHandler(QStringLiteral("ArrowLeft"), [this]() { arrowKey(-1, 0); });
+    c.setHandler(QStringLiteral("ArrowRight"), [this]() { arrowKey(1, 0); });
+    c.setHandler(QStringLiteral("ArrowUp"), [this]() { arrowKey(0, -1); });
+    c.setHandler(QStringLiteral("ArrowDown"), [this]() { arrowKey(0, 1); });
+    c.setHandler(QStringLiteral("PrevFolder"), [this]() { jumpFolder(-1); });
+    c.setHandler(QStringLiteral("NextFolder"), [this]() { jumpFolder(1); });
+    c.setHandler(QStringLiteral("ToggleKeyHints"), [this]() {
+        Config::instance().setBool(mode_ == WindowMode::Browser ? QStringLiteral("Browse/ShowKeyHints") : QStringLiteral("Viewer/ShowKeyHints"),
+                                   Commands::instance().action(QStringLiteral("ToggleKeyHints"))->isChecked());
+        buildStatusBar();
+        updateHint();
+    });
+    c.setHandler(QStringLiteral("FocusNext"), [this]() { browser_->focusCycle(true); });
+    c.setHandler(QStringLiteral("FocusPrev"), [this]() { browser_->focusCycle(false); });
+    c.setHandler(QStringLiteral("FocusPathBar"), [this]() {
+        if (!browser_->pathBarShown()) { showError(S("err.pathBarHidden")); return; }
+        browser_->focusPathBar();
+    });
+    c.setHandler(QStringLiteral("FocusTree"), [this]() {
+        if (!browser_->treeShown()) { showError(S("err.treeHidden")); return; }
+        browser_->focusTree();
+    });
+    c.setHandler(QStringLiteral("FocusFiles"), [this]() { browser_->focusFileArea(); });
+    c.setHandler(QStringLiteral("HistoryBack"), [this]() { browser_->goBack(); });
+    c.setHandler(QStringLiteral("HistoryForward"), [this]() { browser_->goForward(); });
+    c.setHandler(QStringLiteral("ThumbBigger"), [this]() { browser_->adjustThumbSize(1); });
+    c.setHandler(QStringLiteral("ThumbSmaller"), [this]() { browser_->adjustThumbSize(-1); });
+    c.setHandler(QStringLiteral("FilterNext"), [this]() { browser_->filterStep(1); });
+    c.setHandler(QStringLiteral("FilterPrev"), [this]() { browser_->filterStep(-1); });
+    c.setHandler(QStringLiteral("FilterAll"), [this]() { browser_->filterAll(); });
+    c.setHandler(QStringLiteral("SortCycle"), [this]() { browser_->cycleSort(); });
+    c.setHandler(QStringLiteral("SortReverse"), [this]() { browser_->reverseSort(); });
+    c.setHandler(QStringLiteral("ToggleViewStyle"), [this]() { browser_->toggleViewStyle(); });
     c.setHandler(QStringLiteral("ViewDetails"), [this]() { browser_->setViewMode(ViewMode::Details); syncCheckStates(); updateBrowserStatus(); });
 
     // 勾选类命令:改配置后重新应用可见性
@@ -433,6 +480,10 @@ void MainWindow::registerHandlers()
     c.setHandler(QStringLiteral("ToggleMenu"), [this]() {
         const bool v = Commands::instance().action(QStringLiteral("ToggleMenu"))->isChecked();
         Config::instance().setBool(mode_ == WindowMode::Browser ? QStringLiteral("Browse/ShowMenu") : QStringLiteral("Viewer/ShowMenu"), v);
+        applyVisibility();
+    });
+    c.setHandler(QStringLiteral("ToggleInfo"), [this]() {
+        Config::instance().setBool(QStringLiteral("Browse/ShowInfoPanel"), Commands::instance().action(QStringLiteral("ToggleInfo"))->isChecked());
         applyVisibility();
     });
     c.setHandler(QStringLiteral("TogglePathBar"), [this]() {
@@ -500,7 +551,7 @@ void MainWindow::runCustomCommand(const QString& id)
         return;
     }
     if (!QProcess::startDetached(program, args, folder)) {
-        showError(QStringLiteral("无法运行 %1(命令 %2)。请检查 custom_commands.ini 里的 Program 是否写对。").arg(program).arg(id));
+        showError(S("err.customRun").arg(program).arg(id));
     }
 }
 
@@ -538,12 +589,25 @@ void MainWindow::rebuildToolbar()
     Config& cfg = Config::instance();
     Commands& cmds = Commands::instance();
     const QString key = (mode_ == WindowMode::Browser) ? QStringLiteral("Toolbar/Browser") : QStringLiteral("Toolbar/Viewer");
+    browser_->undockPathBar();  // 先把路径栏取出来,否则 clear 会把它一起删掉
     toolbar_->clear();
+    toolbar_->setIconSize(QSize(cfg.getInt(QStringLiteral("Toolbar/IconSize")), cfg.getInt(QStringLiteral("Toolbar/IconSize"))));
     const QStringList items = cfg.getList(key);
     for (int i = 0; i < items.size(); ++i) {
         const QString id = items.at(i);
         if (id == QLatin1String("|")) {
             toolbar_->addSeparator();
+            continue;
+        }
+        if (id == QLatin1String("@PathBar")) {
+            if (mode_ != WindowMode::Browser) Config::fatal(S("err.toolbarPathBarViewer").arg(Config::iniPath()).arg(cfg.lineNumber(key)).arg(key));
+            browser_->dockPathBar(toolbar_);
+            continue;
+        }
+        if (id == QLatin1String("@Stretch")) {
+            QWidget* sp = new QWidget(toolbar_);
+            sp->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+            toolbar_->addWidget(sp);
             continue;
         }
         if (!cmds.has(id)) Config::fatal(S("err.unknownCommand").arg(id).arg(key));
@@ -566,17 +630,29 @@ void MainWindow::buildStatusBar()
     for (int i = 0; i < 6; ++i) {
         if (statusLabels_[i] == nullptr) {
             statusLabels_[i] = new QLabel(this);
-            statusLabels_[i]->setFrameStyle(QFrame::StyledPanel | QFrame::Sunken);
+            statusLabels_[i]->setFrameStyle(Config::instance().getBool(QStringLiteral("StatusBar/Frames")) ? (QFrame::StyledPanel | QFrame::Sunken) : QFrame::NoFrame);
             statusLabels_[i]->setMargin(2);
         } else {
             bar->removeWidget(statusLabels_[i]);
         }
     }
+    // 左侧按键提示条(不强制撑宽窗口;关闭时隐藏,伸缩权交还给文件名栏)
+    if (hintLabel_ == nullptr) {
+        hintLabel_ = new QLabel(this);
+        hintLabel_->setObjectName(QStringLiteral("hintLabel"));
+        hintLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        hintLabel_->setMargin(2);
+    } else {
+        bar->removeWidget(hintLabel_);
+    }
+    const bool hints = hintsVisible();
+    bar->addWidget(hintLabel_, hints ? 1 : 0);
+    hintLabel_->setVisible(hints);
     if (mode_ == WindowMode::Browser) {
-        // 总计 | 选中大小和时间 | 选中文件名(拉伸) | 图片信息
+        // 提示 | 总计 | 选中大小和时间 | 选中文件名(拉伸) | 图片信息
         bar->addWidget(statusLabels_[0], 0);
         bar->addWidget(statusLabels_[1], 0);
-        bar->addWidget(statusLabels_[2], 1);
+        bar->addWidget(statusLabels_[2], hints ? 0 : 1);
         bar->addWidget(statusLabels_[3], 0);
         statusLabels_[0]->setMinimumWidth(170);
         statusLabels_[1]->setMinimumWidth(190);
@@ -588,7 +664,7 @@ void MainWindow::buildStatusBar()
     } else {
         // 序号 | 文件名(拉伸) | 大小 | 图片信息 | 缩放 | 载入时间
         bar->addWidget(statusLabels_[0], 0);
-        bar->addWidget(statusLabels_[1], 1);
+        bar->addWidget(statusLabels_[1], hints ? 0 : 1);
         bar->addWidget(statusLabels_[2], 0);
         bar->addWidget(statusLabels_[3], 0);
         bar->addWidget(statusLabels_[4], 0);
@@ -618,6 +694,7 @@ void MainWindow::setMode(WindowMode mode)
     syncCheckStates();
     restoreGeometry(mode);
     updateTitle();
+    updateHint();
     if (mode == WindowMode::Browser) {
         updateBrowserStatus();
         browser_->focusFileArea();  // 浏览窗口本身 setFocus 没用,方向键选文件要靠里面真正的视图拿到焦点
@@ -626,24 +703,19 @@ void MainWindow::setMode(WindowMode mode)
     }
 }
 
-// 进入查看模式并显示 path
-void MainWindow::enterViewer(const QString& pathIn)
+// 打开 path 所在文件夹并生成查看列表(enterViewer 和以后的跳转共用)
+bool MainWindow::prepareViewList(const QString& path, int* index)
 {
     Config& cfg = Config::instance();
-    const QString path = QDir::fromNativeSeparators(QFileInfo(pathIn).absoluteFilePath());
     const QFileInfo fi(path);
-    if (!fi.isFile()) {
-        showError(S("err.readFile").arg(path).arg(S("err.fileNotFound")));
-        return;
-    }
     FolderList* fl = browser_->folderList();
     if (fl->imageIndexOf(path) < 0) {
-        if (!browser_->openFolder(fi.absolutePath())) return;  // 浏览窗口已弹出错误
+        if (!browser_->openFolder(fi.absolutePath())) return false;  // 浏览窗口已弹出错误
         if (fl->imageIndexOf(path) < 0) {
             QString err;
             if (!fl->addExtraFile(path, &err)) {
                 showError(err);
-                return;
+                return false;
             }
         }
     }
@@ -653,7 +725,7 @@ void MainWindow::enterViewer(const QString& pathIn)
         idx = fl->imageIndexOf(path);
         if (idx < 0) {
             showError(S("err.imageLoad").arg(path).arg(S("err.fileNotFound")));
-            return;
+            return false;
         }
     } else {
         FileEntry e;
@@ -666,6 +738,22 @@ void MainWindow::enterViewer(const QString& pathIn)
         viewList_.append(e);
     }
     lastBrowserFolder_ = fl->folder();
+    *index = idx;
+    return true;
+}
+
+// 进入查看模式并显示 path
+void MainWindow::enterViewer(const QString& pathIn)
+{
+    Config& cfg = Config::instance();
+    const QString path = QDir::fromNativeSeparators(QFileInfo(pathIn).absoluteFilePath());
+    const QFileInfo fi(path);
+    if (!fi.isFile()) {
+        showError(S("err.readFile").arg(path).arg(S("err.fileNotFound")));
+        return;
+    }
+    int idx = 0;
+    if (!prepareViewList(path, &idx)) return;
     setMode(WindowMode::Viewer);
     if (cfg.getBool(QStringLiteral("Viewer/Fullscreen"))) setFullscreen(true);
     gotoImage(idx);
@@ -676,6 +764,7 @@ void MainWindow::leaveViewer()
 {
     if (mode_ != WindowMode::Viewer) return;
     const QString p = currentPath_;
+    settleTimer_->stop();
     if (fullscreen_) setFullscreen(false);
     ImageLoader::instance().cancelPending(QStringList());
     viewer_->clear();
@@ -683,7 +772,11 @@ void MainWindow::leaveViewer()
     currentIndex_ = -1;
     currentPath_.clear();
     setMode(WindowMode::Browser);
-    if (!p.isEmpty()) browser_->selectPath(p);
+    if (!p.isEmpty()) {
+        // 停在刚才看的那张并滚动到可见;窗口尺寸恢复后再滚一次,避免布局未完成时没滚到位
+        browser_->selectPath(p);
+        QTimer::singleShot(0, this, [this, p]() { if (mode_ == WindowMode::Browser) browser_->selectPath(p); });
+    }
 }
 
 // 跳到第 index 张并预加载前后
@@ -710,24 +803,107 @@ void MainWindow::gotoImage(int index)
         statusLabels_[5]->setText(S("status.loading"));
     }
     LoadResult r;
-    if (loader.getCached(currentPath_, &r)) {
-        onImageLoaded(r);
-    } else {
-        loader.request(currentPath_, 10);
+    if (loader.getCached(currentPath_, &r)) onImageLoaded(r);
+    // 没缓存的图和预加载都等"停稳"后再做:按住方向键连续翻页时,中间的图不会被解码
+    const int delay = viewer_->hasImage() ? Config::instance().getInt(QStringLiteral("Viewer/FlipDecodeDelayMs")) : 0;
+    if (delay <= 0) settleFlip();
+    else settleTimer_->start(delay);
+}
+
+// 停稳后真正请求当前图(没缓存时)并预加载前后几张
+void MainWindow::settleFlip()
+{
+    if (mode_ != WindowMode::Viewer || currentIndex_ < 0 || currentIndex_ >= viewList_.size()) return;
+    ImageLoader& loader = ImageLoader::instance();
+    LoadResult r;
+    if (!loader.getCached(currentPath_, &r)) loader.request(currentPath_, 10);
+    const int n = Config::instance().getInt(QStringLiteral("Viewer/PreloadCount"));
+    QStringList pre;
+    for (int k = 1; k <= n; ++k) {
+        if (currentIndex_ + k < viewList_.size()) pre.append(viewList_.at(currentIndex_ + k).path);
+        if (currentIndex_ - k >= 0) pre.append(viewList_.at(currentIndex_ - k).path);
     }
     if (!pre.isEmpty()) loader.prefetch(pre);
 }
 
-// 下一张(到末尾不循环)
+// 下一张;到末尾按 Viewer/Wrap 循环回第一张
 void MainWindow::nextImage()
 {
-    if (currentIndex_ + 1 < viewList_.size()) gotoImage(currentIndex_ + 1);  // TODO-CONFIRM: 到末尾是否循环
+    if (viewList_.size() <= 1) return;
+    if (currentIndex_ + 1 < viewList_.size()) gotoImage(currentIndex_ + 1);
+    else if (Config::instance().getBool(QStringLiteral("Viewer/Wrap"))) gotoImage(0);
 }
 
-// 上一张
+// 上一张;到第一张按 Viewer/Wrap 循环到最后一张
 void MainWindow::prevImage()
 {
+    if (viewList_.size() <= 1) return;
     if (currentIndex_ > 0) gotoImage(currentIndex_ - 1);
+    else if (Config::instance().getBool(QStringLiteral("Viewer/Wrap"))) gotoImage(viewList_.size() - 1);
+}
+
+// 方向键:图片在该方向比窗口大(且 Viewer/ArrowPan 开)就平移,否则翻页
+void MainWindow::arrowKey(int dx, int dy)
+{
+    Config& cfg = Config::instance();
+    if (cfg.getBool(QStringLiteral("Viewer/ArrowPan")) && viewer_->canPan(dx != 0)) {
+        const int step = cfg.getInt(QStringLiteral("Viewer/PanStep"));
+        viewer_->panBy(-dx * step, -dy * step);
+        return;
+    }
+    if (dx < 0 || dy < 0) prevImage();
+    else nextImage();
+}
+
+// 跳到上/下一个有图片的文件夹(同一父文件夹下按名称排序),显示它的第一张;到头按 Viewer/Wrap 循环
+void MainWindow::jumpFolder(int dir)
+{
+    if (mode_ != WindowMode::Viewer) return;
+    Config& cfg = Config::instance();
+    const QDir cur(browser_->currentFolder());
+    QDir parent(cur);
+    if (!parent.cdUp()) {
+        showError(S("err.noParentFolder").arg(QDir::toNativeSeparators(cur.absolutePath())));
+        return;
+    }
+    QDir::Filters f = QDir::Dirs | QDir::NoDotAndDotDot;
+    const bool hidden = cfg.getBool(QStringLiteral("FileList/ShowHidden"));
+    if (hidden) f |= QDir::Hidden;
+    const QStringList dirs = parent.entryList(f, QDir::Name | QDir::IgnoreCase);
+    const int n = dirs.size();
+    int at = -1;
+    for (int i = 0; i < n; ++i) {
+        if (dirs.at(i).compare(cur.dirName(), Qt::CaseInsensitive) == 0) at = i;
+    }
+    if (at < 0) {
+        showError(S("err.noOtherImageFolder"));
+        return;
+    }
+    const bool wrap = cfg.getBool(QStringLiteral("Viewer/Wrap"));
+    for (int step = 1; step < n; ++step) {
+        int k = at + dir * step;
+        if (k < 0 || k >= n) {
+            if (!wrap) break;
+            k = ((k % n) + n) % n;
+        }
+        const QString folder = parent.absoluteFilePath(dirs.at(k));
+        QDir::Filters ff = QDir::Files;
+        if (hidden) ff |= QDir::Hidden;
+        const QStringList files = QDir(folder).entryList(ff);
+        bool hasImage = false;
+        for (int j = 0; j < files.size() && !hasImage; ++j) hasImage = FolderList::isImagePath(files.at(j));
+        if (!hasImage) continue;
+        if (!browser_->openFolder(folder)) return;  // 浏览窗口已弹出错误
+        const QList<FileEntry> ents = browser_->folderList()->imageEntries();
+        if (ents.isEmpty()) continue;
+        viewList_.clear();
+        if (cfg.getBool(QStringLiteral("Viewer/ViewAllInFolder"))) viewList_ = ents;
+        else viewList_.append(ents.first());
+        lastBrowserFolder_ = browser_->currentFolder();
+        gotoImage(0);
+        return;
+    }
+    showError(S("err.noOtherImageFolder"));
 }
 
 // 第一张
@@ -873,12 +1049,31 @@ void MainWindow::applyVisibility()
         browser_->setPathBarVisible(cfg.getBool(QStringLiteral("Browse/ShowPathBar")));
         browser_->setTreeVisible(cfg.getBool(QStringLiteral("Browse/ShowTree")));
         browser_->setPreviewVisible(cfg.getBool(QStringLiteral("Browse/ShowPreview")));
+        browser_->setInfoVisible(cfg.getBool(QStringLiteral("Browse/ShowInfoPanel")));
     } else {
         const bool fs = fullscreen_;
         menuBar()->setVisible(!fs && cfg.getBool(QStringLiteral("Viewer/ShowMenu")));
         toolbar_->setVisible(!fs && cfg.getBool(QStringLiteral("Viewer/ShowToolbar")));
         statusBar()->setVisible(!fs && cfg.getBool(QStringLiteral("Viewer/ShowStatusBar")));
     }
+}
+
+// Windows 10/11 深色标题栏:Display/DarkTitleBar = Auto(按主题背景色深浅)/On/Off;其他系统不处理
+void MainWindow::applyTitleBar()
+{
+#ifdef Q_OS_WIN
+    const QString mode = Config::instance().getEnum(QStringLiteral("Display/DarkTitleBar"));
+    bool dark = false;
+    if (mode == QLatin1String("On")) {
+        dark = true;
+    } else if (mode == QLatin1String("Auto")) {
+        dark = Theme::color(QStringLiteral("bg")).lightnessF() < 0.5;
+    }
+    const BOOL v = dark ? TRUE : FALSE;
+    const HWND h = reinterpret_cast<HWND>(winId());
+    // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE(旧 Win10 内部版本用 19,系统不认时返回失败,这里再试一次)
+    if (FAILED(DwmSetWindowAttribute(h, 20, &v, sizeof(v)))) DwmSetWindowAttribute(h, 19, &v, sizeof(v));
+#endif
 }
 
 // 删除(浏览:选中项;查看:当前图)
@@ -1155,6 +1350,8 @@ void MainWindow::syncCheckStates()
     c.action(QStringLiteral("TogglePathBar"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowPathBar")));
     c.action(QStringLiteral("ToggleTree"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowTree")));
     c.action(QStringLiteral("TogglePreview"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowPreview")));
+    c.action(QStringLiteral("ToggleInfo"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowInfoPanel")));
+    c.action(QStringLiteral("ToggleKeyHints"))->setChecked(hintsVisible());
     c.action(QStringLiteral("AlwaysOnTop"))->setChecked(cfg.getBool(QStringLiteral("Viewer/AlwaysOnTop")));
     c.action(QStringLiteral("Fullscreen"))->setChecked(fullscreen_);
     c.action(QStringLiteral("ZoomLock"))->setChecked(cfg.getBool(QStringLiteral("Viewer/ZoomLock")));
@@ -1164,6 +1361,52 @@ void MainWindow::syncCheckStates()
     c.action(QStringLiteral("ViewIcons"))->setChecked(vm == ViewMode::Icons);
     c.action(QStringLiteral("ViewList"))->setChecked(vm == ViewMode::List);
     c.action(QStringLiteral("ViewDetails"))->setChecked(vm == ViewMode::Details);
+}
+
+// 提示条开关(按模式)
+bool MainWindow::hintsVisible() const
+{
+    return Config::instance().getBool(mode_ == WindowMode::Browser ? QStringLiteral("Browse/ShowKeyHints")
+                                                                    : QStringLiteral("Viewer/ShowKeyHints"));
+}
+
+// 模板里的 {命令ID} 换成该命令的第一个快捷键;命令不存在或没设键都明说
+QString MainWindow::expandHint(const QString& tpl) const
+{
+    QString out;
+    int i = 0;
+    while (i < tpl.size()) {
+        const int a = tpl.indexOf(QLatin1Char('{'), i);
+        if (a < 0) { out += tpl.mid(i); break; }
+        const int b = tpl.indexOf(QLatin1Char('}'), a);
+        if (b < 0) Config::fatal(S("err.hintTemplate").arg(tpl));
+        out += tpl.mid(i, a - i);
+        const QString id = tpl.mid(a + 1, b - a - 1);
+        if (!Commands::instance().has(id)) Config::fatal(S("err.hintCommand").arg(id).arg(tpl));
+        const QList<QKeySequence> ks = Commands::instance().action(id)->shortcuts();
+        out += ks.isEmpty() ? S("hint.noKey") : ks.first().toString(QKeySequence::NativeText);
+        i = b + 1;
+    }
+    return out;
+}
+
+// 状态栏左侧提示:浏览模式按焦点区域,查看模式按图片是否放大到能平移
+void MainWindow::updateHint()
+{
+    if (hintLabel_ == nullptr || !hintsVisible()) return;
+    QString key;
+    if (mode_ == WindowMode::Browser) {
+        switch (browser_->focusArea()) {
+        case FocusArea::Tree: key = QStringLiteral("hint.browser.tree"); break;
+        case FocusArea::PathBar: key = QStringLiteral("hint.browser.path"); break;
+        case FocusArea::Files: key = QStringLiteral("hint.browser.files"); break;
+        }
+    } else {
+        const bool pan = Config::instance().getBool(QStringLiteral("Viewer/ArrowPan"))
+                         && (viewer_->canPan(true) || viewer_->canPan(false));
+        key = pan ? QStringLiteral("hint.viewer.zoomed") : QStringLiteral("hint.viewer");
+    }
+    hintLabel_->setText(expandHint(S(key)));
 }
 
 // 保存窗口几何(按模式分别保存到 QuickView.state)
@@ -1241,6 +1484,8 @@ QStringList MainWindow::targetPaths() const
         if (!currentPath_.isEmpty()) out.append(currentPath_);
         return out;
     }
+    // 焦点在文件夹树/路径栏时,文件操作不作用于文件区的选中项
+    if (browser_->focusArea() != FocusArea::Files) return QStringList();
     QStringList sel = browser_->selectedPaths();
     if (sel.isEmpty()) {
         const QString cur = browser_->currentFilePath();

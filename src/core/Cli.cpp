@@ -99,6 +99,7 @@ static int listCommands()
 static void checkRef(const QString& key, const QString& id, QStringList* errors, bool allowSpecial)
 {
     if (id == QLatin1String("|")) return;
+    if (key.startsWith(QLatin1String("Toolbar/")) && (id == QLatin1String("@PathBar") || id == QLatin1String("@Stretch"))) return;
     if (allowSpecial && (id == QLatin1String("None") || id == QLatin1String("Pan") || id == QLatin1String("ContextMenu"))) return;
     if (Commands::instance().has(id)) return;
     errors->append(QStringLiteral("%1 第%2行 [%3]:引用了不存在的命令 %4")
@@ -126,6 +127,7 @@ static int checkConfig()
     QStringList errors;
     QString qss;
     if (!Theme::read(&qss, &error)) errors.append(error);
+    else if (!Theme::checkVars(qss, &error)) errors.append(error);
 
     Commands& cmds = Commands::instance();
     cmds.registerDefaults();

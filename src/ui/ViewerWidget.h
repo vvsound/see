@@ -23,6 +23,10 @@ public:
     bool hasImage() const;
     // 当前缩放比例(1.0 = 100%)
     double zoom() const;
+    // 图片在水平/垂直方向上是否比窗口大(大了才能平移)
+    bool canPan(bool horizontal) const;
+    // 平移图片 dx,dy 像素(正数=图片向右/下移动),超出范围自动限制
+    void panBy(int dx, int dy);
     // 设置缩放;anchor 为视图坐标中的缩放中心(0,0 表示用窗口中心)
     void setZoom(double z, const QPointF& anchor, bool useAnchor);
     // 放大一档 / 缩小一档(以窗口中心为中心)

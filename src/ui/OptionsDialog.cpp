@@ -2,9 +2,13 @@
 #include "core/Config.h"
 #include "core/Strings.h"
 #include "core/FolderList.h"
+#include "core/Theme.h"
 #include "platform/FileAssoc.h"
 
 #include <QColorDialog>
+#include <QPainter>
+#include <QPixmap>
+#include <QIcon>
 #include <QDialogButtonBox>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -24,14 +28,22 @@ QWidget* wrapScroll(QWidget* content)
     return area;
 }
 
-// 给颜色按钮设置显示颜色
+// 给颜色按钮设置显示颜色:按钮本身的样式完全走主题,颜色用图标色块表示(边框色取主题 border)
 void paintColorButton(QPushButton* b, const QColor& c)
 {
     b->setProperty("color", c.name(QColor::HexRgb));
     b->setText(c.name(QColor::HexRgb).toUpper());
-    b->setStyleSheet(QStringLiteral("QPushButton { background-color: %1; color: %2; }")
-                         .arg(c.name(QColor::HexRgb))
-                         .arg(c.lightness() < 128 ? QStringLiteral("#FFFFFF") : QStringLiteral("#000000")));
+    const QSize sz(36, 16);
+    QPixmap pm(sz);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setBrush(c);
+    p.setPen(QPen(Theme::color(QStringLiteral("border")), 1));
+    p.drawRoundedRect(QRectF(0.5, 0.5, sz.width() - 1, sz.height() - 1), 4, 4);
+    p.end();
+    b->setIcon(QIcon(pm));
+    b->setIconSize(sz);
 }
 
 // "段/键" 对应的界面文字键

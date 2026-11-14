@@ -74,8 +74,24 @@ private:
     void enterViewer(const QString& path);
     // 回到浏览模式(选中刚才查看的图片)
     void leaveViewer();
+    // 按 Display/DarkTitleBar 设置 Windows 标题栏深浅
+    void applyTitleBar();
     // 跳到第 index 张图(0 起),并预加载前后
     void gotoImage(int index);
+    // 方向键:图片比窗口大时平移,否则翻页(见 Viewer/ArrowPan)
+    void arrowKey(int dx, int dy);
+    // 跳到上/下一个有图片的文件夹的第一张(dir=-1/+1)
+    void jumpFolder(int dir);
+    // 翻页停稳后才真正请求解码并预加载(按住方向键时中间的图不解码)
+    void settleFlip();
+    // 打开 path 所在文件夹并生成查看列表;失败已弹错误并返回 false
+    bool prepareViewList(const QString& path, int* index);
+    // 按当前模式/焦点区域更新状态栏左侧的按键提示
+    void updateHint();
+    // 把提示模板里的 {命令ID} 换成该命令当前的第一个快捷键
+    QString expandHint(const QString& tpl) const;
+    // 提示条是否显示(按模式读 Browse/ShowKeyHints 或 Viewer/ShowKeyHints)
+    bool hintsVisible() const;
     // 翻页命令
     void nextImage();
     void prevImage();
@@ -146,6 +162,8 @@ private:
     ViewerWidget* viewer_;
     QToolBar* toolbar_;
     QLabel* statusLabels_[6];
+    QLabel* hintLabel_;
+    QTimer* settleTimer_;
     WindowMode mode_;
     QString currentPath_;        // 查看模式当前图片
     int currentIndex_;

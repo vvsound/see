@@ -1,11 +1,14 @@
 #include "Commands.h"
 #include "Config.h"
 #include "Strings.h"
+#include "Theme.h"
 
 #include <QFile>
 #include <QKeySequence>
 #include <QKeyCombination>
 #include <QMap>
+#include <QPixmap>
+#include <QRegularExpression>
 
 Commands::Commands() : QObject(nullptr) {}
 
@@ -40,8 +43,8 @@ void Commands::registerDefaults()
         {"Exit", "Alt+F4", "exit.svg", false, A},
         {"GoUp", "Backspace", "up.svg", false, B},
         {"Refresh", "F5", "refresh.svg", false, B},
-        {"NextImage", "Space,PageDown,Right,Down", "next.svg", false, V},
-        {"PrevImage", "Backspace,PageUp,Left,Up", "prev.svg", false, V},
+        {"NextImage", "Space,PageDown", "next.svg", false, V},
+        {"PrevImage", "Backspace,PageUp", "prev.svg", false, V},
         {"FirstImage", "Home", "first.svg", false, V},
         {"LastImage", "End", "last.svg", false, V},
         {"BackToBrowser", "Esc,Return,Enter", "back.svg", false, V},
@@ -84,7 +87,30 @@ void Commands::registerDefaults()
         {"SaveAs", "Ctrl+S", "copyto.svg", false, V},
         {"CloseImage", "Ctrl+Q", "back.svg", false, V},
         {"ZoomLock", "Ctrl+L", "fit.svg", true, V},
-        {"RotateBy", "", "rotr.svg", false, V}
+        {"RotateBy", "", "rotr.svg", false, V},
+        {"FocusNext", "Tab", "", false, B},
+        {"FocusPrev", "Shift+Tab", "", false, B},
+        {"FocusPathBar", "Ctrl+L", "toggle_pathbar.svg", false, B},
+        {"FocusTree", "F4", "toggle_tree.svg", false, B},
+        {"FocusFiles", "Esc", "view_thumbs.svg", false, B},
+        {"HistoryBack", "Alt+Left", "prev.svg", false, B},
+        {"HistoryForward", "Alt+Right", "next.svg", false, B},
+        {"ThumbBigger", "+,=", "zoomin.svg", false, B},
+        {"ThumbSmaller", "-", "zoomout.svg", false, B},
+        {"ToggleInfo", "I", "info.svg", true, B},
+        {"ArrowLeft", "Left", "", false, V},
+        {"ArrowRight", "Right", "", false, V},
+        {"ArrowUp", "Up", "", false, V},
+        {"ArrowDown", "Down", "", false, V},
+        {"PrevFolder", "Ctrl+Left", "first.svg", false, V},
+        {"NextFolder", "Ctrl+Right", "last.svg", false, V},
+        {"FilterNext", "]", "filter.svg", false, B},
+        {"FilterPrev", "[", "filter.svg", false, B},
+        {"FilterAll", "0", "filter.svg", false, B},
+        {"SortCycle", "S", "sort.svg", false, B},
+        {"SortReverse", "Shift+S", "sort.svg", false, B},
+        {"ToggleViewStyle", "G", "view_thumbs.svg", false, B},
+        {"ToggleKeyHints", "F1", "hint.svg", true, A}
     };
     const int n = int(sizeof(rows) / sizeof(rows[0]));
     for (int i = 0; i < n; ++i) {
@@ -125,6 +151,7 @@ static int keyFromName(const QString& name)
         table.insert(QStringLiteral("up"), Qt::Key_Up);
         table.insert(QStringLiteral("down"), Qt::Key_Down);
         table.insert(QStringLiteral("tab"), Qt::Key_Tab);
+        table.insert(QStringLiteral("backtab"), Qt::Key_Backtab);
         for (int i = 1; i <= 24; ++i) table.insert(QStringLiteral("f%1").arg(i), Qt::Key_F1 + i - 1);
     }
     const QString low = name.toLower();
@@ -176,6 +203,10 @@ QList<QKeySequence> Commands::parseKeys(const QString& id, const QString& text) 
             Config::fatal(S("err.keyInvalid").arg(id).arg(s));
         }
         out.append(QKeySequence(QKeyCombination(m, static_cast<Qt::Key>(key))));
+        // Shift+Tab 在键盘事件里是 Backtab,两种写法都要认
+        if (key == Qt::Key_Tab && (m & Qt::ShiftModifier) != 0) {
+            out.append(QKeySequence(QKeyCombination(m, Qt::Key_Backtab)));
+        }
     }
     return out;
 }
@@ -197,6 +228,32 @@ void Commands::createActions(QObject* parent)
         a->setIconVisibleInMenu(false);
         connect(a, SIGNAL(triggered()), this, SLOT(onActionTriggered()));
         actions_.insert(d.id, a);
+    }
+    checkShortcutConflicts();
+}
+
+// 同一窗口模式下两个命令用了同一个键:直接报错,指出两个命令和键(Both 范围的命令与任何范围都算同时生效)
+void Commands::checkShortcutConflicts() const
+{
+    QMap<QString, QString> seen[2];  // 0=浏览 1=查看:键 -> 命令 ID
+    for (int i = 0; i < defs_.size(); ++i) {
+        const CommandDef& d = defs_.at(i);
+        QAction* a = actions_.value(d.id, nullptr);
+        if (a == nullptr) continue;
+        const QList<QKeySequence> ks = a->shortcuts();
+        for (int k = 0; k < ks.size(); ++k) {
+            const QString key = ks.at(k).toString(QKeySequence::PortableText);
+            for (int m = 0; m < 2; ++m) {
+                const bool applies = (d.scope == CmdScope::Both) || (m == 0 && d.scope == CmdScope::Browser)
+                                     || (m == 1 && d.scope == CmdScope::Viewer);
+                if (!applies) continue;
+                const QString other = seen[m].value(key);
+                if (!other.isEmpty() && other != d.id) {
+                    Config::fatal(S("err.keyConflict").arg(key).arg(other).arg(d.id));
+                }
+                seen[m].insert(key, d.id);
+            }
+        }
     }
 }
 
@@ -277,14 +334,47 @@ void Commands::setMode(WindowMode mode)
     }
 }
 
-// 命令图标:先找 exe 旁 icons 文件夹,再找内置
+// 把 svg 文本里的描边颜色换成 color,并把根标签的 width/height 改成 size,渲染成位图
+static QPixmap renderSvg(const QString& svg, const QString& color, int size, const QString& where)
+{
+    QString t = svg;
+    static const QRegularExpression strokeRe(QStringLiteral("stroke=\"(?!none)[^\"]*\""));
+    t.replace(strokeRe, QStringLiteral("stroke=\"%1\"").arg(color));
+    const int open = t.indexOf(QLatin1String("<svg"));
+    const int close = (open >= 0) ? t.indexOf(QLatin1Char('>'), open) : -1;
+    if (close < 0 || !t.mid(open, close - open).contains(QLatin1String("viewBox"))) {
+        Config::fatal(QStringLiteral("图标 %1 不是有效的 svg(需要根标签 <svg ... viewBox=\"...\">)。").arg(where));
+    }
+    QString tag = t.mid(open, close - open);
+    static const QRegularExpression whRe(QStringLiteral("\\s(width|height)=\"[^\"]*\""));
+    tag.remove(whRe);
+    tag += QStringLiteral(" width=\"%1\" height=\"%1\"").arg(size);
+    t = t.left(open) + tag + t.mid(close);
+    QPixmap pm;
+    if (!pm.loadFromData(t.toUtf8(), "svg")) Config::fatal(QStringLiteral("图标 %1 无法渲染(svg 内容有误或缺少 Qt svg 插件)。").arg(where));
+    return pm;
+}
+
+// 命令图标:先找 exe 旁 icons 文件夹,再找内置;Icons/Tint 开启时按主题 icon / fg_dim 颜色重新着色
 QIcon Commands::iconFor(const QString& id) const
 {
     const CommandDef d = def(id);
     if (d.iconFile.isEmpty()) return QIcon();
     const QString external = Config::appDir() + QStringLiteral("/icons/") + d.iconFile;
-    if (QFile::exists(external)) return QIcon(external);
-    return QIcon(QStringLiteral(":/icons/") + d.iconFile);
+    const QString path = QFile::exists(external) ? external : (QStringLiteral(":/icons/") + d.iconFile);
+    if (!Config::instance().getBool(QStringLiteral("Icons/Tint"))) return QIcon(path);
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) Config::fatal(QStringLiteral("无法读取图标 %1:%2").arg(path).arg(f.errorString()));
+    const QString svg = QString::fromUtf8(f.readAll());
+    const QString normal = Theme::color(QStringLiteral("icon")).name(QColor::HexRgb);
+    const QString dim = Theme::color(QStringLiteral("fg_dim")).name(QColor::HexRgb);
+    static const int sizes[] = {16, 24, 32, 48};
+    QIcon ic;
+    for (int i = 0; i < 4; ++i) {
+        ic.addPixmap(renderSvg(svg, normal, sizes[i], path), QIcon::Normal);
+        ic.addPixmap(renderSvg(svg, dim, sizes[i], path), QIcon::Disabled);
+    }
+    return ic;
 }
 
 // 命令显示名

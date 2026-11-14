@@ -42,6 +42,7 @@ void PreviewPane::clear()
     shownPath_.clear();
     image_ = QImage();
     error_.clear();
+    emit imageChanged(image_);
     update();
 }
 
@@ -101,5 +102,6 @@ void PreviewPane::onPreviewReady(const QString& path, const QImage& image, const
     if (image.isNull() && error.isEmpty()) {
         error_ = S("err.imageLoad").arg(path).arg(S("err.noDecoder").arg(path));
     }
+    emit imageChanged(image_);
     update();
 }

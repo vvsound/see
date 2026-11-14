@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QMap>
 #include <QColor>
+#include <QStringList>
 #include "core/Types.h"
 #include "core/FolderList.h"
 #include "core/DescriptIon.h"
@@ -56,6 +57,10 @@ public:
     void setParentRowVisible(bool visible);
     // 设置当前显示方式(缩略图方式会隐藏非图片/文件夹,按缩略图页选项)
     void setViewMode(ViewMode mode);
+    // 按扩展名筛选:on 为假时全部显示;exts 为小写扩展名(空串=没有扩展名)。文件夹不受影响。不自动重新装载,调用后请 reload()
+    void setExtFilter(bool on, const QStringList& exts);
+    // 当前文件夹里(按当前显示方式本来会显示的)文件,每种扩展名各有几个;不受扩展名筛选影响。供筛选条生成标签
+    QMap<QString, int> extensionCounts() const;
     // 清除"读取失败"记录(手动刷新时调用,失败的文件会重新尝试)
     void clearFailed();
 
@@ -78,6 +83,8 @@ private:
     QString sizeText(const FileEntry& e) const;
     // 当前模式下是否显示此项
     bool visible(const FileEntry& e) const;
+    // 同上,但不考虑扩展名筛选
+    bool visibleIgnoringFilter(const FileEntry& e) const;
 
     FolderList* list_;
     QList<FileEntry> rows_;
@@ -101,4 +108,6 @@ private:
     QString descrErrFolder_;                // 已经报过读取错误的文件夹(避免自动刷新时重复弹窗)
     bool showShortcuts_;                    // Browse/ShowShortcuts
     bool descEditable_;                     // Browse/DoubleClickEditDescription
+    bool extFilterOn_;                      // 是否按扩展名筛选
+    QStringList extFilter_;                 // 允许显示的扩展名
 };

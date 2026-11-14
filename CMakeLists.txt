@@ -37,6 +37,8 @@ set(QV_SOURCES
     src/core/SingleInstance.cpp
     src/core/Cli.h
     src/core/Cli.cpp
+    src/core/ExifReader.h
+    src/core/ExifReader.cpp
     src/core/Theme.h
     src/core/Theme.cpp
     src/core/CustomCommands.h
@@ -47,6 +49,10 @@ set(QV_SOURCES
     src/ui/BrowserWidget.cpp
     src/ui/FileListModel.h
     src/ui/FileListModel.cpp
+    src/ui/InfoPanel.h
+    src/ui/InfoPanel.cpp
+    src/ui/FilterBar.h
+    src/ui/FilterBar.cpp
     src/ui/PreviewPane.h
     src/ui/PreviewPane.cpp
     src/ui/OptionsDialog.h
@@ -68,5 +74,5 @@ if(MSVC)
     target_link_options(QuickView PRIVATE /ENTRY:mainCRTStartup)
 endif()
 if(WIN32)
-    target_link_libraries(QuickView PRIVATE advapi32 shell32 user32)
+    target_link_libraries(QuickView PRIVATE advapi32 shell32 user32 dwmapi)
 endif()

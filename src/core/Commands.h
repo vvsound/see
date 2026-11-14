@@ -71,6 +71,8 @@ private slots:
     void onActionTriggered();
 
 private:
+    // 创建完 action 后检查同一模式下有没有键冲突
+    void checkShortcutConflicts() const;
     Commands();
     QList<CommandDef> defs_;
     QMap<QString, int> defIndex_;

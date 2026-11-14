@@ -1,16 +1,19 @@
 #include "BrowserWidget.h"
 
 #include <QStyle>
+#include <QFocusEvent>
 #include "core/Config.h"
 #include "core/State.h"
 #include "core/Strings.h"
 #include "core/ImageLoader.h"
 #include "core/ThumbnailCache.h"
+#include "core/Theme.h"
 
 #include <QVBoxLayout>
 #include <QHeaderView>
 #include <QStyledItemDelegate>
 #include <QPainter>
+#include <QPainterPath>
 #include <QFileInfo>
 #include <QDir>
 #include <QLineEdit>
@@ -43,7 +46,26 @@ QString bytesText(qint64 bytes)
 class ThumbDelegate : public QStyledItemDelegate {
 public:
     explicit ThumbDelegate(QObject* parent)
-        : QStyledItemDelegate(parent), withText_(true), border_(6), showArea_(true), showSize_(false) {}
+        : QStyledItemDelegate(parent), withText_(true), border_(6), showArea_(true), showSize_(false),
+          cellRadius_(8), imageRadius_(4), imageBorder_(false), hover_(true), focusWidth_(2) {}
+
+    // 外观:圆角/边框/悬停/焦点框粗细来自 ini,颜色来自主题(取不到主题变量会直接报错)
+    void configureStyle(int cellRadius, int imageRadius, bool imageBorder, bool hover, int focusWidth)
+    {
+        cellRadius_ = cellRadius;
+        imageRadius_ = imageRadius;
+        imageBorder_ = imageBorder;
+        hover_ = hover;
+        focusWidth_ = focusWidth;
+        selColor_ = Theme::color(QStringLiteral("accent_soft"));
+        selBorder_ = Theme::color(QStringLiteral("accent"));
+        hoverColor_ = Theme::color(QStringLiteral("hover"));
+        focusColor_ = Theme::color(QStringLiteral("focus"));
+        textColor_ = Theme::color(QStringLiteral("fg"));
+        dimColor_ = Theme::color(QStringLiteral("fg_dim"));
+        borderColor_ = Theme::color(QStringLiteral("border"));
+        dangerColor_ = Theme::color(QStringLiteral("danger"));
+    }
 
     // 设置:是否带文字、边界、是否显示图片面积、是否显示文件大小
     void configure(bool withText, int border, bool showArea, bool showSize)
@@ -74,9 +96,27 @@ public:
     void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override
     {
         painter->save();
+        painter->setRenderHint(QPainter::Antialiasing, true);
         const bool sel = (option.state & QStyle::State_Selected) != 0;
+        const bool hot = hover_ && (option.state & QStyle::State_MouseOver) != 0;
+        const bool focus = (option.state & QStyle::State_HasFocus) != 0;
         const QRect cell = option.rect;
-        if (sel) painter->fillRect(cell, option.palette.highlight());
+        const QRectF box = QRectF(cell).adjusted(1.5, 1.5, -1.5, -1.5);
+        if (sel || hot) {
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(sel ? selColor_ : hoverColor_);
+            painter->drawRoundedRect(box, cellRadius_, cellRadius_);
+        }
+        if (focus && focusWidth_ > 0) {
+            painter->setBrush(Qt::NoBrush);
+            painter->setPen(QPen(focusColor_, focusWidth_));
+            const qreal h = focusWidth_ / 2.0;
+            painter->drawRoundedRect(box.adjusted(h, h, -h, -h), cellRadius_, cellRadius_);
+        } else if (sel) {
+            painter->setBrush(Qt::NoBrush);
+            painter->setPen(QPen(selBorder_, 1));
+            painter->drawRoundedRect(box, cellRadius_, cellRadius_);
+        }
         const QSize ts = ThumbnailCache::instance().thumbSize();
         const QRect imgArea(cell.left() + border_, cell.top() + border_, cell.width() - 2 * border_, ts.height());
         const bool isImage = index.data(FileListModel::IsImageRole).toBool();
@@ -84,15 +124,23 @@ public:
         if (!th.isNull()) {
             QRect tr(QPoint(0, 0), th.size());
             tr.moveCenter(imgArea.center());
+            painter->save();
+            QPainterPath clip;
+            clip.addRoundedRect(QRectF(tr), imageRadius_, imageRadius_);
+            painter->setClipPath(clip);
             painter->drawImage(tr, th);
-            painter->setPen(QColor(128, 128, 128));
-            painter->drawRect(tr.adjusted(0, 0, -1, -1));
+            painter->restore();
+            if (imageBorder_) {
+                painter->setBrush(Qt::NoBrush);
+                painter->setPen(QPen(borderColor_, 1));
+                painter->drawRoundedRect(QRectF(tr).adjusted(0.5, 0.5, -0.5, -0.5), imageRadius_, imageRadius_);
+            }
         } else if (isImage) {
             const QString err = index.data(FileListModel::ErrorRole).toString();
             QFont f = option.font;
             f.setPointSize(f.pointSize() * 2);
             painter->setFont(f);
-            painter->setPen(err.isEmpty() ? QColor(150, 150, 150) : QColor(200, 50, 50));
+            painter->setPen(err.isEmpty() ? dimColor_ : dangerColor_);
             painter->drawText(imgArea, Qt::AlignCenter, err.isEmpty() ? QStringLiteral("...") : QStringLiteral("x"));
         } else {
             const QIcon ic = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
@@ -105,7 +153,6 @@ public:
             const QFontMetrics fm(option.font);
             const int lh = fm.height();
             painter->setFont(option.font);
-            painter->setPen(sel ? option.palette.highlightedText().color() : option.palette.text().color());
             const int y0 = cell.top() + border_ + ts.height() + 2;
             QString info;
             if (isImage) {
@@ -117,7 +164,9 @@ public:
             }
             const QRect l1(cell.left() + 2, y0, cell.width() - 4, lh);
             const QRect l2(cell.left() + 2, y0 + lh, cell.width() - 4, lh);
+            painter->setPen(dimColor_);
             painter->drawText(l1, Qt::AlignHCenter | Qt::AlignVCenter, fm.elidedText(info, Qt::ElideRight, l1.width()));
+            painter->setPen(textColor_);
             const QString name = index.data(Qt::DisplayRole).toString();
             painter->drawText(l2, Qt::AlignHCenter | Qt::AlignVCenter, fm.elidedText(name, Qt::ElideMiddle, l2.width()));
         }
@@ -129,6 +178,12 @@ private:
     int border_;
     bool showArea_;
     bool showSize_;
+    int cellRadius_;
+    int imageRadius_;
+    bool imageBorder_;
+    bool hover_;
+    int focusWidth_;
+    QColor selColor_, selBorder_, hoverColor_, focusColor_, textColor_, dimColor_, borderColor_, dangerColor_;
 };
 
 } // namespace
@@ -136,9 +191,10 @@ private:
 // 构造
 BrowserWidget::BrowserWidget(QWidget* parent)
     : QWidget(parent), pathBox_(nullptr), hSplit_(nullptr), vSplit_(nullptr), tree_(nullptr), treeModel_(nullptr),
-      preview_(nullptr), viewStack_(nullptr), listView_(nullptr), detailView_(nullptr), model_(nullptr),
-      folderList_(nullptr), previewTimer_(nullptr), thumbDelegate_(nullptr), plainDelegate_(nullptr),
-      mode_(ViewMode::Details), treeVisible_(true), previewVisible_(true), pathBarVisible_(true)
+      preview_(nullptr), info_(nullptr), infoVisible_(true), centerPane_(nullptr), filterBar_(nullptr), viewStack_(nullptr), listView_(nullptr), detailView_(nullptr), model_(nullptr),
+      folderList_(nullptr), previewTimer_(nullptr), treeTimer_(nullptr), focusArea_(FocusArea::Files),
+      histPos_(-1), navigatingHistory_(false), syncingTree_(false), thumbDelegate_(nullptr), plainDelegate_(nullptr),
+      mode_(ViewMode::Details), treeVisible_(true), previewVisible_(true), pathBarVisible_(true), pathAction_(nullptr)
 {
     buildUi();
     applyOptions();
@@ -163,9 +219,20 @@ void BrowserWidget::buildUi()
     vSplit_ = new QSplitter(Qt::Vertical, hSplit_);
     tree_ = new QTreeView(vSplit_);
     preview_ = new PreviewPane(vSplit_);
-    viewStack_ = new QStackedWidget(hSplit_);
+    centerPane_ = new QWidget(hSplit_);
+    QVBoxLayout* centerLay = new QVBoxLayout(centerPane_);
+    centerLay->setContentsMargins(0, 0, 0, 0);
+    centerLay->setSpacing(0);
+    filterBar_ = new FilterBar(centerPane_);
+    centerLay->addWidget(filterBar_);
+    viewStack_ = new QStackedWidget(centerPane_);
+    centerLay->addWidget(viewStack_, 1);
+    info_ = new InfoPanel(hSplit_);
+    info_->setMinimumWidth(150);
     hSplit_->setStretchFactor(0, 0);
     hSplit_->setStretchFactor(1, 1);
+    hSplit_->setStretchFactor(2, 0);
+    hSplit_->setSizes(QList<int>() << 216 << 800 << Config::instance().getInt(QStringLiteral("Info/PanelWidth")));
     vSplit_->setStretchFactor(0, 1);
     vSplit_->setStretchFactor(1, 0);
 
@@ -213,6 +280,19 @@ void BrowserWidget::buildUi()
     previewTimer_->setSingleShot(true);
     previewTimer_->setInterval(30);
 
+    // 树键盘移动后延迟载入目录(毫秒数见 Browse/TreeLoadDelayMs)
+    treeTimer_ = new QTimer(this);
+    treeTimer_->setSingleShot(true);
+    treeTimer_->setInterval(Config::instance().getInt(QStringLiteral("Browse/TreeLoadDelayMs")));
+    connect(treeTimer_, &QTimer::timeout, this, &BrowserWidget::onTreeTimer);
+    connect(tree_->selectionModel(), &QItemSelectionModel::currentChanged, this, [this]() { onTreeCurrentChanged(); });
+
+    // 焦点区域跟踪:这四个部件获得/失去焦点时更新焦点框
+    tree_->installEventFilter(this);
+    listView_->installEventFilter(this);
+    detailView_->installEventFilter(this);
+    pathBox_->lineEdit()->installEventFilter(this);
+
     // 右键:在视口上用自定义菜单策略
     listView_->viewport()->setContextMenuPolicy(Qt::CustomContextMenu);
     detailView_->viewport()->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -232,6 +312,9 @@ void BrowserWidget::buildUi()
     connect(detailView_->selectionModel(), &QItemSelectionModel::currentChanged, this, [this]() { onSelectionChanged(); });
     connect(detailView_->header(), &QHeaderView::sectionClicked, this, &BrowserWidget::onHeaderClicked);
     connect(folderList_, &FolderList::changed, this, &BrowserWidget::onFolderListChanged);
+    connect(filterBar_, &FilterBar::filterChanged, this, &BrowserWidget::onFilterChanged);
+    connect(filterBar_, &FilterBar::sortChanged, this, &BrowserWidget::onFilterSort);
+    connect(filterBar_, &FilterBar::viewCommandRequested, this, [this](const QString& id) { emit commandRequested(id); });
     connect(folderList_, &FolderList::newFilesFound, this, [this](const QStringList& paths) {
         if (Config::instance().getBool(QStringLiteral("FileList/AutoSelectNewFiles")) && !paths.isEmpty()) {
             selectPath(paths.last());
@@ -247,6 +330,11 @@ void BrowserWidget::buildUi()
         for (int i = 0; i < rec.size(); ++i) pathBox_->addItem(QDir::toNativeSeparators(rec.at(i)));
         pathBox_->setCurrentIndex(-1);
     }
+    // 位置记忆:成对读入(文件夹、文件名)
+    positions_ = State::instance().getList(QStringLiteral("folderPositions"));
+    if (positions_.size() % 2 != 0) {
+        Config::fatal(S("err.stateFile").arg(State::statePath()).arg(QStringLiteral("folderPositions")));
+    }
 }
 
 // 进入文件夹;失败弹出错误并返回 false
@@ -254,6 +342,8 @@ bool BrowserWidget::openFolder(const QString& path)
 {
     const QString p = QDir::cleanPath(QDir::fromNativeSeparators(path.trimmed()));
     QString err;
+    treeTimer_->stop();
+    rememberPosition();  // 离开前记住当前文件夹里选中的项
     preview_->clear();
     ThumbnailCache::instance().cancelAll();
     if (!folderList_->setFolder(p, &err)) {
@@ -265,6 +355,8 @@ bool BrowserWidget::openFolder(const QString& path)
     updatePathBar(folder_);
     syncTreeTo(folder_);
     rememberFolder(folder_);
+    pushHistory(folder_);
+    restorePosition();
     emit folderChanged(folder_);
     return true;
 }
@@ -336,6 +428,8 @@ void BrowserWidget::setViewMode(ViewMode mode)
         viewStack_->setCurrentWidget(listView_);
     }
     updateLeftPane();
+    filterBar_->setGrid(mode == ViewMode::ThumbInfo || mode == ViewMode::Thumbs || mode == ViewMode::Icons);
+    if (updateFilterBar()) model_->reload();
     State::instance().setString(QStringLiteral("browser.viewMode"), viewModeToString(mode));
     // 恢复选择
     detailView_->selectionModel()->blockSignals(true);
@@ -366,6 +460,9 @@ void BrowserWidget::applyOptions()
     ThumbnailCache::instance().configure();
     model_->applyOptions();
     preview_->applyOptions();
+    info_->applyOptions();
+    info_->setVisible(infoVisible_);
+    filterBar_->applyOptions();
     folderList_->applyOptions();
 
     // 目录树
@@ -412,7 +509,7 @@ void BrowserWidget::refresh()
     folderList_->refresh();
 }
 
-// 上一级
+// 上一级:光标落在刚离开的那个文件夹上
 void BrowserWidget::goUp()
 {
     QDir d(folderList_->folder());
@@ -424,10 +521,228 @@ void BrowserWidget::goUp()
     }
 }
 
-// 把焦点交给当前视图(缩略图/图标/列表/详细),方向键才能选文件
+// 把焦点交给当前视图(缩略图/图标/列表/详细),方向键才能选文件;从路径栏回来时恢复路径栏文字
 void BrowserWidget::focusFileArea()
 {
+    if (pathBox_->lineEdit()->hasFocus() && !folder_.isEmpty()) {
+        pathBox_->lineEdit()->setText(QDir::toNativeSeparators(folder_));
+    }
     activeView()->setFocus();
+}
+
+// 当前焦点区域
+FocusArea BrowserWidget::focusArea() const
+{
+    return focusArea_;
+}
+
+// 焦点交给文件夹树
+void BrowserWidget::focusTree()
+{
+    if (!treeVisible_) return;
+    tree_->setFocus();
+}
+
+// 焦点交给路径栏并全选文字
+void BrowserWidget::focusPathBar()
+{
+    if (!pathBarVisible_) return;
+    pathBox_->lineEdit()->setFocus();
+    pathBox_->lineEdit()->selectAll();
+}
+
+// 在可见区域间循环:路径栏 -> 文件夹树 -> 文件区
+void BrowserWidget::focusCycle(bool forward)
+{
+    QList<FocusArea> order;
+    if (pathBarVisible_) order.append(FocusArea::PathBar);
+    if (treeVisible_) order.append(FocusArea::Tree);
+    order.append(FocusArea::Files);
+    int i = order.indexOf(focusArea_);
+    if (i < 0) i = order.size() - 1;
+    const int n = order.size();
+    i = (i + (forward ? 1 : n - 1)) % n;
+    switch (order.at(i)) {
+    case FocusArea::PathBar: focusPathBar(); break;
+    case FocusArea::Tree: focusTree(); break;
+    case FocusArea::Files: focusFileArea(); break;
+    }
+}
+
+// 在历史里走一步
+bool BrowserWidget::navigateHistory(int delta)
+{
+    const int np = histPos_ + delta;
+    if (np < 0 || np >= history_.size()) return false;
+    navigatingHistory_ = true;
+    const bool ok = openFolder(history_.at(np));
+    navigatingHistory_ = false;
+    if (ok) {
+        histPos_ = np;
+        focusFileArea();
+    }
+    return ok;
+}
+
+// 后退 / 前进
+bool BrowserWidget::goBack()
+{
+    return navigateHistory(-1);
+}
+
+bool BrowserWidget::goForward()
+{
+    return navigateHistory(1);
+}
+
+// 进入新文件夹时记入历史(丢弃"前进"那一段;数量见 Browse/HistoryCount)
+void BrowserWidget::pushHistory(const QString& path)
+{
+    if (navigatingHistory_) return;
+    if (histPos_ >= 0 && histPos_ < history_.size() && history_.at(histPos_) == path) return;
+    while (history_.size() > histPos_ + 1) history_.removeLast();
+    history_.append(path);
+    const int limit = Config::instance().getInt(QStringLiteral("Browse/HistoryCount"));
+    while (history_.size() > limit) history_.removeFirst();
+    histPos_ = history_.size() - 1;
+}
+
+// 记住当前文件夹里的焦点文件(数量上限 Browse/PositionMemoryCount,0 表示不记)
+void BrowserWidget::rememberPosition()
+{
+    const int limit = Config::instance().getInt(QStringLiteral("Browse/PositionMemoryCount"));
+    if (limit <= 0 || folder_.isEmpty()) return;
+    const QString cur = currentFilePath();
+    if (cur.isEmpty()) return;
+    for (int i = 0; i + 1 < positions_.size(); i += 2) {
+        if (positions_.at(i) == folder_) {
+            positions_.removeAt(i + 1);
+            positions_.removeAt(i);
+            break;
+        }
+    }
+    positions_.prepend(QFileInfo(cur).fileName());
+    positions_.prepend(folder_);
+    while (positions_.size() > limit * 2) {
+        positions_.removeLast();
+        positions_.removeLast();
+    }
+}
+
+// 进入文件夹后恢复上次选中项;没有记忆就选第一项(Browse/EnterSelectFirst)
+void BrowserWidget::restorePosition()
+{
+    for (int i = 0; i + 1 < positions_.size(); i += 2) {
+        if (positions_.at(i) != folder_) continue;
+        const QString path = QDir(folder_).filePath(positions_.at(i + 1));
+        if (model_->rowOfPath(path) >= 0) {
+            selectPath(path);
+            return;
+        }
+        break;
+    }
+    if (!Config::instance().getBool(QStringLiteral("Browse/EnterSelectFirst"))) return;
+    const int row = model_->hasParentRow() ? 1 : 0;
+    if (row >= model_->rowCount(QModelIndex())) return;
+    const QModelIndex idx = model_->index(row, 0);
+    detailView_->selectionModel()->setCurrentIndex(idx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    activeView()->scrollTo(idx);
+}
+
+// 缩略图放大/缩小一步
+void BrowserWidget::adjustThumbSize(int direction)
+{
+    if (mode_ != ViewMode::ThumbInfo && mode_ != ViewMode::Thumbs) return;
+    Config& cfg = Config::instance();
+    const int step = cfg.getInt(QStringLiteral("Thumbnails/SizeStep"));
+    const int lo = cfg.getInt(QStringLiteral("Thumbnails/MinSize"));
+    const int hi = cfg.getInt(QStringLiteral("Thumbnails/MaxSize"));
+    const int cur = cfg.getInt(QStringLiteral("Thumbnails/Width"));
+    const int next = std::max(lo, std::min(hi, cur + (direction > 0 ? step : -step)));
+    if (next == cur) return;
+    cfg.setInt(QStringLiteral("Thumbnails/Width"), next);
+    cfg.setInt(QStringLiteral("Thumbnails/Height"), next);
+    ThumbnailCache::instance().configure();
+    configureListView();
+    listView_->viewport()->update();
+    if (listView_->currentIndex().isValid()) listView_->scrollTo(listView_->currentIndex());
+}
+
+// 筛选条:切换标签
+void BrowserWidget::filterStep(int delta)
+{
+    filterBar_->cycleTag(delta);
+}
+
+// 筛选条:回到"全部"
+void BrowserWidget::filterAll()
+{
+    filterBar_->selectAllTag();
+}
+
+// 筛选条:下一种排序依据
+void BrowserWidget::cycleSort()
+{
+    if (!filterBar_->barEnabled()) return;
+    filterBar_->cycleSort();
+}
+
+// 筛选条:反转排序方向
+void BrowserWidget::reverseSort()
+{
+    if (!filterBar_->barEnabled()) return;
+    filterBar_->reverseSort();
+}
+
+// 切换网格/列表
+void BrowserWidget::toggleViewStyle()
+{
+    if (!filterBar_->barEnabled()) return;
+    emit commandRequested(filterBar_->toggleCommand());
+}
+
+// 筛选标签变了:重新装载并保持选择
+void BrowserWidget::onFilterChanged()
+{
+    model_->setExtFilter(filterBar_->filterActive(), filterBar_->filterExts());
+    onFolderListChanged();
+}
+
+// 筛选条改了排序
+void BrowserWidget::onFilterSort(SortKey key, bool desc)
+{
+    folderList_->setSort(key, desc);
+    State::instance().setInt(QStringLiteral("sort.key"), static_cast<int>(key));
+    State::instance().setBool(QStringLiteral("sort.desc"), desc);
+    syncSortIndicators();
+}
+
+// 把排序状态同步到表头和筛选条
+void BrowserWidget::syncSortIndicators()
+{
+    const SortKey key = folderList_->sortKey();
+    const bool desc = folderList_->sortDescending();
+    int section = 0;
+    if (key == SortKey::Size) section = 1;
+    else if (key == SortKey::Type) section = 2;
+    else if (key == SortKey::Date) section = 3;
+    detailView_->header()->setSortIndicator(section, desc ? Qt::DescendingOrder : Qt::AscendingOrder);
+    filterBar_->setSort(key, desc);
+}
+
+// 用当前文件夹的内容刷新筛选条;模型的筛选条件因此改变时返回 true(调用者要重新装载模型)
+bool BrowserWidget::updateFilterBar()
+{
+    const bool changedFolder = (filterFolder_ != folderList_->folder());
+    filterFolder_ = folderList_->folder();
+    const bool oldOn = filterBar_->filterActive();
+    const QStringList oldExts = filterBar_->filterExts();
+    // 数量不受筛选影响,所以直接向模型要
+    filterBar_->setExtensions(model_->extensionCounts(), changedFolder);
+    const bool newOn = filterBar_->filterActive();
+    const QStringList newExts = filterBar_->filterExts();
+    model_->setExtFilter(newOn, newExts);
+    return oldOn != newOn || oldExts != newExts;
 }
 
 // 全选(不含 "..")
@@ -444,6 +759,10 @@ void BrowserWidget::activateCurrent()
 {
     if (pathBox_->lineEdit() != nullptr && pathBox_->lineEdit()->hasFocus()) {
         onPathActivated();
+        return;
+    }
+    if (tree_->hasFocus()) {
+        activateTreeItem();
         return;
     }
     const QModelIndex cur = activeView()->currentIndex();
@@ -509,6 +828,7 @@ void BrowserWidget::setTreeVisible(bool v)
 {
     treeVisible_ = v;
     updateLeftPane();
+    if (!v && focusArea_ == FocusArea::Tree) focusFileArea();  // 焦点区域被隐藏:回到文件区
 }
 
 // 预览显示/隐藏
@@ -518,11 +838,45 @@ void BrowserWidget::setPreviewVisible(bool v)
     updateLeftPane();
 }
 
+// 信息面板显示/隐藏
+void BrowserWidget::setInfoVisible(bool v)
+{
+    infoVisible_ = v;
+    info_->setVisible(v);
+    if (v) previewTimer_->start();
+}
+
 // 路径栏显示/隐藏
 void BrowserWidget::setPathBarVisible(bool v)
 {
     pathBarVisible_ = v;
-    pathBox_->setVisible(v);
+    if (pathAction_ != nullptr) pathAction_->setVisible(v);
+    else pathBox_->setVisible(v);
+    if (!v && focusArea_ == FocusArea::PathBar) focusFileArea();
+}
+
+// 路径栏放进工具栏:拉伸占满剩余宽度
+void BrowserWidget::dockPathBar(QToolBar* bar)
+{
+    if (pathAction_ != nullptr) return;
+    QVBoxLayout* lay = qobject_cast<QVBoxLayout*>(layout());
+    if (lay != nullptr) lay->removeWidget(pathBox_);
+    pathBox_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    pathAction_ = bar->addWidget(pathBox_);
+    pathAction_->setVisible(pathBarVisible_);
+    pathBox_->setVisible(true);
+}
+
+// 路径栏放回浏览窗口顶部(必须在工具栏 clear 之前调用,否则路径栏会随工具栏被删除)
+void BrowserWidget::undockPathBar()
+{
+    if (pathAction_ == nullptr) return;
+    pathAction_ = nullptr;
+    pathBox_->setParent(this);
+    pathBox_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    QVBoxLayout* lay = qobject_cast<QVBoxLayout*>(layout());
+    if (lay != nullptr) lay->insertWidget(0, pathBox_);
+    pathBox_->setVisible(pathBarVisible_);
 }
 
 // 路径栏历史
@@ -545,6 +899,8 @@ void BrowserWidget::saveLayout()
     const QList<int> vs = vSplit_->sizes();
     for (int i = 0; i < vs.size(); ++i) v << QString::number(vs.at(i));
     st.setList(QStringLiteral("layout.vsplit"), v);
+    rememberPosition();
+    st.setList(QStringLiteral("folderPositions"), positions_);
     st.setString(QStringLiteral("browser.viewMode"), viewModeToString(mode_));
     st.setInt(QStringLiteral("sort.key"), static_cast<int>(folderList_->sortKey()));
     st.setBool(QStringLiteral("sort.desc"), folderList_->sortDescending());
@@ -578,28 +934,37 @@ void BrowserWidget::restoreLayout()
     if (sk < 0 || sk > 3) Config::fatal(S("err.stateFile").arg(State::statePath()).arg(QStringLiteral("sort.key")));
     const bool desc = st.getBool(QStringLiteral("sort.desc"), false);
     folderList_->setSort(static_cast<SortKey>(sk), desc);
-    detailView_->header()->setSortIndicator(sk, desc ? Qt::DescendingOrder : Qt::AscendingOrder);
+    syncSortIndicators();
     setViewMode(m);
 }
 
 // 事件过滤:右键时先选中光标下的项
 bool BrowserWidget::eventFilter(QObject* obj, QEvent* e)
 {
-    // Ctrl+滚轮:缩略图方式下放大/缩小缩略图(每格 16 像素,范围 32~256)
+    // 焦点跟踪:获得焦点时记下区域并画焦点框(窗口失活造成的失焦不算)
+    if (e->type() == QEvent::FocusIn || e->type() == QEvent::FocusOut) {
+        QWidget* w = qobject_cast<QWidget*>(obj);
+        const bool isEdit = (w == pathBox_->lineEdit());
+        if (w != nullptr && (w == tree_ || w == listView_ || w == detailView_ || isEdit)) {
+            const bool in = (e->type() == QEvent::FocusIn);
+            if (!in) {
+                const Qt::FocusReason r = static_cast<QFocusEvent*>(e)->reason();
+                if (r == Qt::ActiveWindowFocusReason || r == Qt::PopupFocusReason) return QWidget::eventFilter(obj, e);
+            }
+            if (in) {
+                focusArea_ = (w == tree_) ? FocusArea::Tree : (isEdit ? FocusArea::PathBar : FocusArea::Files);
+                emit focusAreaChanged();
+            }
+            if (Config::instance().getBool(QStringLiteral("Browse/FocusFrame"))) setFocusFrame(isEdit ? static_cast<QWidget*>(pathBox_) : w, in);
+            return QWidget::eventFilter(obj, e);
+        }
+    }
+    // Ctrl+滚轮:缩略图方式下放大/缩小缩略图(步长和范围见 [Thumbnails])
     if (e->type() == QEvent::Wheel && obj == listView_->viewport()
         && (mode_ == ViewMode::ThumbInfo || mode_ == ViewMode::Thumbs)) {
         QWheelEvent* we = static_cast<QWheelEvent*>(e);
         if ((we->modifiers() & Qt::ControlModifier) != 0 && we->angleDelta().y() != 0) {
-            Config& cfg = Config::instance();
-            const int cur = cfg.getInt(QStringLiteral("Thumbnails/Width"));
-            const int next = std::max(32, std::min(256, cur + (we->angleDelta().y() > 0 ? 16 : -16)));
-            if (next != cur) {
-                cfg.setInt(QStringLiteral("Thumbnails/Width"), next);
-                cfg.setInt(QStringLiteral("Thumbnails/Height"), next);
-                ThumbnailCache::instance().configure();
-                configureListView();
-                listView_->viewport()->update();
-            }
+            adjustThumbSize(we->angleDelta().y() > 0 ? 1 : -1);
             return true;
         }
     }
@@ -630,6 +995,47 @@ void BrowserWidget::onTreeClicked(const QModelIndex& index)
     if (p.isEmpty()) return;  // 虚拟节点(此电脑、库)只展开不跳转
     if (QDir::cleanPath(p) == folderList_->folder()) return;
     openFolder(p);
+}
+
+// 焦点框:属性 mmFocus=true 时主题 QSS 画强调色边框
+void BrowserWidget::setFocusFrame(QWidget* w, bool on)
+{
+    w->setProperty("mmFocus", on);
+    w->style()->unpolish(w);
+    w->style()->polish(w);
+    w->update();
+}
+
+// 树里键盘移动:树有焦点时才算(程序同步选中项不算),延迟后载入
+void BrowserWidget::onTreeCurrentChanged()
+{
+    if (syncingTree_ || !tree_->hasFocus()) return;
+    treeTimer_->start();
+}
+
+// 延迟到:载入树当前项的目录(虚拟节点和当前文件夹跳过)
+void BrowserWidget::onTreeTimer()
+{
+    const QModelIndex idx = tree_->currentIndex();
+    if (!idx.isValid()) return;
+    const QString p = idx.data(Qt::UserRole + 1).toString();
+    if (p.isEmpty() || QDir::cleanPath(p) == folderList_->folder()) return;
+    openFolder(p);
+}
+
+// Enter:目录节点立刻进入并把焦点交给文件区;"此电脑""库"这类虚拟节点只展开/折叠
+void BrowserWidget::activateTreeItem()
+{
+    const QModelIndex idx = tree_->currentIndex();
+    if (!idx.isValid()) return;
+    const QString p = idx.data(Qt::UserRole + 1).toString();
+    if (p.isEmpty()) {
+        tree_->setExpanded(idx, !tree_->isExpanded(idx));
+        return;
+    }
+    treeTimer_->stop();
+    if (QDir::cleanPath(p) != folderList_->folder() && !openFolder(p)) return;
+    focusFileArea();
 }
 
 // 路径栏回车或选择
@@ -682,6 +1088,7 @@ void BrowserWidget::onFolderListChanged()
 {
     const QStringList sel = selectedPaths();
     const QString cur = currentFilePath();
+    updateFilterBar();  // 返回值不用:下一行本来就要重新装载
     model_->reload();
     QItemSelectionModel* sm = detailView_->selectionModel();
     sm->blockSignals(true);
@@ -711,13 +1118,19 @@ void BrowserWidget::onHeaderClicked(int section)
     folderList_->setSort(key, desc);
     State::instance().setInt(QStringLiteral("sort.key"), static_cast<int>(key));
     State::instance().setBool(QStringLiteral("sort.desc"), desc);
+    filterBar_->setSort(key, desc);
 }
 
 // 预览延迟更新
 void BrowserWidget::onPreviewTimer()
 {
+    const QString curSel = currentFilePath();
+    if (info_->isVisible()) {
+        if (!curSel.isEmpty() && FolderList::isImagePath(curSel) && QFileInfo(curSel).isFile()) info_->showFile(curSel);
+        else info_->clear();
+    }
     if (!preview_->isVisible()) return;
-    const QString cur = currentFilePath();
+    const QString cur = curSel;
     if (cur.isEmpty() || !FolderList::isImagePath(cur) || !QFileInfo(cur).isFile()) {
         preview_->clear();
         return;
@@ -761,9 +1174,11 @@ void BrowserWidget::syncTreeTo(const QString& path)
     QStandardItem* found = findTreeItem(treeModel_->invisibleRootItem(), QDir::cleanPath(path));
     if (found == nullptr) return;
     tree_->blockSignals(true);
+    syncingTree_ = true;
     const QModelIndex idx = treeModel_->indexFromItem(found);
     tree_->setCurrentIndex(idx);
     tree_->scrollTo(idx);
+    syncingTree_ = false;
     tree_->blockSignals(false);
 }
 
@@ -904,6 +1319,9 @@ void BrowserWidget::configureListView()
         td->configure(mode_ == ViewMode::ThumbInfo, cfg.getInt(QStringLiteral("Thumbnails/Border")),
                       cfg.getBool(QStringLiteral("Thumbnails/ShowImageArea")),
                       cfg.getBool(QStringLiteral("Thumbnails/ShowFileSize")));
+        td->configureStyle(cfg.getInt(QStringLiteral("Thumbnails/CellRadius")), cfg.getInt(QStringLiteral("Thumbnails/ImageRadius")),
+                           cfg.getBool(QStringLiteral("Thumbnails/ImageBorder")), cfg.getBool(QStringLiteral("Thumbnails/HoverHighlight")),
+                           cfg.getInt(QStringLiteral("Thumbnails/FocusWidth")));
         listView_->setItemDelegate(thumbDelegate_);
         listView_->setViewMode(QListView::IconMode);
         listView_->setFlow(QListView::LeftToRight);

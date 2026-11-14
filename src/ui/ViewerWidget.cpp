@@ -397,6 +397,23 @@ QRectF ViewerWidget::imageRect() const
     return QRectF(c.x() - s.width() / 2.0, c.y() - s.height() / 2.0, s.width(), s.height());
 }
 
+// 图片在某方向上比窗口大吗
+bool ViewerWidget::canPan(bool horizontal) const
+{
+    if (!hasImage()) return false;
+    const QSize d = displaySizeAt100();
+    const double len = horizontal ? d.width() * zoom_ : d.height() * zoom_;
+    return len > (horizontal ? width() : height()) + 0.5;
+}
+
+// 平移
+void ViewerWidget::panBy(int dx, int dy)
+{
+    offset_ += QPointF(dx, dy);
+    clampOffset();
+    update();
+}
+
 // 限制偏移量:图片比视图小的方向居中,大的方向不让边缘进入视野
 void ViewerWidget::clampOffset()
 {

@@ -39,7 +39,7 @@ bool isThumbMode(ViewMode m)
 FileListModel::FileListModel(QObject* parent)
     : QAbstractTableModel(parent), list_(nullptr), parentRow_(false), mode_(ViewMode::Details),
       sizeInKB_(true), highlightImages_(true), useSystemIcons_(true), readInfoPolicy_(0),
-      hasParentNow_(false), readInfoNow_(true), infoTips_(true), thumbShowFolders_(true), thumbShowAll_(false), showShortcuts_(true), descEditable_(false)
+      hasParentNow_(false), readInfoNow_(true), infoTips_(true), thumbShowFolders_(true), thumbShowAll_(false), showShortcuts_(true), descEditable_(false), extFilterOn_(false)
 {
     highlightColor_ = QColor(0xE6, 0xF0, 0xFF);
     connect(&ThumbnailCache::instance(), &ThumbnailCache::ready, this, &FileListModel::onThumbReady);
@@ -316,6 +316,13 @@ void FileListModel::setViewMode(ViewMode mode)
     reload();
 }
 
+// 设置扩展名筛选
+void FileListModel::setExtFilter(bool on, const QStringList& exts)
+{
+    extFilterOn_ = on;
+    extFilter_ = exts;
+}
+
 // 清除读取失败记录
 void FileListModel::clearFailed()
 {
@@ -368,6 +375,14 @@ QString FileListModel::sizeText(const FileEntry& e) const
 // 当前模式下是否显示此项
 bool FileListModel::visible(const FileEntry& e) const
 {
+    if (!visibleIgnoringFilter(e)) return false;
+    if (extFilterOn_ && !e.isDir && !extFilter_.contains(QFileInfo(e.name).suffix().toLower())) return false;
+    return true;
+}
+
+// 不考虑扩展名筛选时是否显示此项
+bool FileListModel::visibleIgnoringFilter(const FileEntry& e) const
+{
     // Browse/ShowShortcuts 关闭时隐藏 .lnk 快捷方式文件
     if (!e.isDir && !showShortcuts_ && e.name.endsWith(QStringLiteral(".lnk"), Qt::CaseInsensitive)) return false;
     if (isThumbMode(mode_)) {
@@ -375,4 +390,18 @@ bool FileListModel::visible(const FileEntry& e) const
         if (!e.isImage) return thumbShowAll_;
     }
     return true;
+}
+
+// 每种扩展名的文件数
+QMap<QString, int> FileListModel::extensionCounts() const
+{
+    QMap<QString, int> out;
+    if (list_ == nullptr) return out;
+    const QList<FileEntry>& src = list_->entries();
+    for (int i = 0; i < src.size(); ++i) {
+        const FileEntry& e = src.at(i);
+        if (e.isDir || !visibleIgnoringFilter(e)) continue;
+        out[QFileInfo(e.name).suffix().toLower()] += 1;
+    }
+    return out;
 }

@@ -28,6 +28,8 @@ private slots:
     void onPreviewReady(const QString& path, const QImage& image, const QString& error);
 
 signals:
+    // 预览图变了(清空时是空图);直方图等用它
+    void imageChanged(const QImage& image);
     // 内部:后台线程把结果送回主线程
     void previewDone(const QString& path, const QImage& image, const QString& error);
 
