@@ -61,18 +61,15 @@ set(QV_SOURCES
     src/ui/ExtensionsDialog.cpp
     src/platform/FileAssoc.h
     src/platform/FileAssoc.cpp
-    src/platform/Shell.h
-    src/platform/Shell.cpp
     resources/resources.qrc
 )
 
-# Windows 资源(exe 图标 + 版本信息)
-if(WIN32)
-    enable_language(RC)
-    list(APPEND QV_SOURCES resources/app.rc)
-endif()
-
 add_executable(QuickView WIN32 ${QV_SOURCES})
+if(WIN32)
+    # exe 文件本身的图标和版本信息(资源管理器、任务栏、默认应用列表显示的就是它)
+    enable_language(RC)
+    target_sources(QuickView PRIVATE resources/app.rc)
+endif()
 target_include_directories(QuickView PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(QuickView PRIVATE
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::PrintSupport Qt6::Concurrent Qt6::Network)

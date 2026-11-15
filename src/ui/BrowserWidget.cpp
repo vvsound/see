@@ -1501,6 +1501,10 @@ void BrowserWidget::configureListView()
     listView_->setWrapping(true);
     listView_->setResizeMode(QListView::Adjust);
     listView_->setMovement(QListView::Static);
+    // 注意:setMovement(Static) 会顺手把"可拖出"关掉,必须在它之后再打开,否则缩略图/图标/列表方式都拖不出去
+    listView_->setDragEnabled(true);
+    listView_->setDragDropMode(QAbstractItemView::DragOnly);
+    listView_->setDefaultDropAction(Qt::CopyAction);
     listView_->setUniformItemSizes(true);
     listView_->setSpacing(0);
     listView_->setModelColumn(0);
