@@ -47,6 +47,8 @@ public:
     void applyOptions();
     // 刷新当前文件夹
     void refresh();
+    // 重建左边的文件夹树并定位到当前文件夹(改名/新建/删除文件夹后调用)
+    void refreshTree();
     // 上一级
     void goUp();
     // 把键盘焦点交给当前显示方式对应的文件区视图(缩略图/图标/列表/详细),这样方向键才能选文件。
@@ -115,6 +117,8 @@ signals:
     void commandRequested(const QString& id);
     // 请求弹出右键菜单
     void contextMenuRequested(const QPoint& globalPos);
+    // 在左边文件夹树的某个文件夹上点了右键(path 是该文件夹的路径)
+    void treeContextMenuRequested(const QString& path, const QPoint& globalPos);
 
 protected:
     // 事件过滤:捕获列表上的右键、焦点变化、Ctrl+滚轮
@@ -123,6 +127,8 @@ protected:
 private slots:
     // 树里点击了文件夹
     void onTreeClicked(const QModelIndex& index);
+    // 树里右键
+    void onTreeContextMenu(const QPoint& pos);
     // 树节点展开时读入子文件夹
     void onTreeExpanded(const QModelIndex& index);
     // 路径栏回车或选择
@@ -209,6 +215,9 @@ private:
     QTimer* treeTimer_;
     FocusArea focusArea_;
     int wheelAcc_ = 0;  // Ctrl+滚轮累计量
+    QPoint rightPressPos_;          // 右键按下的位置(右键拖动用)
+    bool rightDragArmed_ = false;   // 右键按在文件上,移动够远就开始拖动
+    void startFileDrag();
     void setThumbSize(int size);
     QStringList history_;         // 目录历史
     int histPos_;                 // 当前在历史里的位置

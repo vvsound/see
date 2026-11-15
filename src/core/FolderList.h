@@ -62,6 +62,15 @@ public:
     static int naturalCompare(const QString& a, const QString& b);
     // 启用/停用文件夹变化自动刷新(读 FileList/AutoRefresh)
     void applyOptions();
+    // 是否把所有子文件夹里的图片也并进当前列表(平铺显示,文件名显示为 子文件夹/文件名);开关存在 QuickView.state
+    void setIncludeSubfolders(bool on);
+    bool includeSubfolders() const;
+    // 平铺时最多收多少个文件(防止在盘符根目录一次扫太多卡死)
+    static int subfolderLimit();
+
+public:
+    // 上一次扫描因为超过上限而没收完子文件夹里的图片
+    bool subfoldersTruncated() const { return subTruncated_; }
 
 signals:
     // 列表内容已改变(扫描完成、刷新)
@@ -82,6 +91,8 @@ private:
     void rebuildView();
 
     QString folder_;
+    bool includeSub_ = false;
+    bool subTruncated_ = false;
     QList<FileEntry> all_;       // 扫描到的全部项
     QList<FileEntry> entries_;   // 过滤排序后
     QList<FileEntry> extras_;    // 外部添加的文件

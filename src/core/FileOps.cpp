@@ -19,6 +19,29 @@
 #include <QRegularExpression>
 #include <QUrl>
 
+namespace {
+// 递归复制文件夹
+bool copyDirRecursive(const QString& src, const QString& dest, QString* why)
+{
+    if (!QDir().mkpath(dest)) {
+        if (why != nullptr) *why = dest;
+        return false;
+    }
+    const QFileInfoList list = QDir(src).entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System);
+    for (int i = 0; i < list.size(); ++i) {
+        const QFileInfo& fi = list.at(i);
+        const QString to = QDir(dest).absoluteFilePath(fi.fileName());
+        if (fi.isDir() && !fi.isSymLink()) {
+            if (!copyDirRecursive(fi.absoluteFilePath(), to, why)) return false;
+        } else if (!QFile::copy(fi.absoluteFilePath(), to)) {
+            if (why != nullptr) *why = fi.absoluteFilePath();
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
 // 按"归档"页选项删除
 bool FileOps::deleteFiles(QWidget* parent, const QStringList& paths, QString* error)
 {
@@ -110,9 +133,11 @@ bool FileOps::copyOrMoveWithDialog(QWidget* parent, const QStringList& paths, bo
 }
 
 // 复制或移动到指定文件夹
-bool FileOps::copyOrMove(QWidget* parent, const QStringList& paths, const QString& destDir, bool move, QString* error)
+bool FileOps::copyOrMove(QWidget* parent, const QStringList& paths, const QString& destDir, bool move, QString* error,
+                         QStringList* created)
 {
     if (error != nullptr) error->clear();
+    if (created != nullptr) created->clear();
     Config& cfg = Config::instance();
     const QString policy = cfg.getEnum(QStringLiteral("Archive/DuplicateAction"));
     const bool skipIdentical = cfg.getBool(QStringLiteral("Archive/SkipIfIdentical"));
@@ -123,6 +148,7 @@ bool FileOps::copyOrMove(QWidget* parent, const QStringList& paths, const QStrin
     for (int i = 0; i < paths.size(); ++i) {
         const QString src = paths.at(i);
         const QString fileName = QFileInfo(src).fileName();
+        const bool srcIsDir = QFileInfo(src).isDir();
         QString dest = QDir(destDir).absoluteFilePath(fileName);
         const bool samePlace = (QFileInfo(src).absoluteFilePath().compare(
                                     QFileInfo(dest).absoluteFilePath(), Qt::CaseInsensitive) == 0);
@@ -151,6 +177,7 @@ bool FileOps::copyOrMove(QWidget* parent, const QStringList& paths, const QStrin
                 else if (box.clickedButton() == bRen) action = QStringLiteral("AutoRename");
                 else action = QStringLiteral("Skip");
             }
+            if (srcIsDir && action == QLatin1String("Overwrite")) action = QStringLiteral("AutoRename");  // 文件夹不整个覆盖
             if (action == QLatin1String("Skip")) {
                 continue;
             } else if (action == QLatin1String("AutoRename")) {
@@ -162,7 +189,24 @@ bool FileOps::copyOrMove(QWidget* parent, const QStringList& paths, const QStrin
                 }
             }
         }
-        if (move) {
+        if (srcIsDir) {
+            if (QFileInfo(destDir).absoluteFilePath().startsWith(QFileInfo(src).absoluteFilePath() + QLatin1Char('/'), Qt::CaseInsensitive)) {
+                if (error != nullptr) *error = S(move ? "err.move" : "err.copy").arg(src).arg(destDir).arg(S("err.intoSelf"));
+                return false;   // 不能把文件夹复制/移动到它自己里面
+            }
+            bool done = move && QDir().rename(src, dest);
+            if (!done) {
+                QString why;
+                if (!copyDirRecursive(src, dest, &why)) {
+                    if (error != nullptr) *error = S(move ? "err.move" : "err.copy").arg(src).arg(destDir).arg(why);
+                    return false;
+                }
+                if (move && !QDir(src).removeRecursively()) {
+                    if (error != nullptr) *error = S("err.move").arg(src).arg(destDir).arg(src);
+                    return false;
+                }
+            }
+        } else if (move) {
             QFile f(src);
             if (!f.rename(dest)) {
                 // 跨磁盘时 rename 会失败:改为复制后删除原文件
@@ -183,6 +227,7 @@ bool FileOps::copyOrMove(QWidget* parent, const QStringList& paths, const QStrin
                 return false;
             }
         }
+        if (created != nullptr) created->append(dest);
     }
     return true;
 }

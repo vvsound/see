@@ -16,7 +16,9 @@ public:
     // 选择目标文件夹后复制或移动;move 为 true 是移动;按"归档"页处理重复文件
     static bool copyOrMoveWithDialog(QWidget* parent, const QStringList& paths, bool move, QString* error);
     // 复制或移动到指定文件夹(处理重复文件策略);成功返回 true
-    static bool copyOrMove(QWidget* parent, const QStringList& paths, const QString& destDir, bool move, QString* error);
+    // created 非空时,收集实际生成的新路径(粘贴后用来选中副本)
+    static bool copyOrMove(QWidget* parent, const QStringList& paths, const QString& destDir, bool move, QString* error,
+                           QStringList* created = nullptr);
     // 在目标文件夹里生成不重复的文件名(用 RenameSeparator,如 a_1.jpg)
     static QString uniqueName(const QString& destDir, const QString& fileName);
     // 两个文件内容是否完全相同

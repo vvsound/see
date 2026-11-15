@@ -1,4 +1,8 @@
 #include "FileListModel.h"
+#include <QMimeData>
+#include <QUrl>
+#include <QSet>
+#include <QFileInfo>
 #include "core/Config.h"
 #include "core/Strings.h"
 #include "core/FileOps.h"
@@ -171,7 +175,7 @@ QVariant FileListModel::data(const QModelIndex& index, int role) const
         if (col == 3 && descr_ && !e.isDir) return descr_->get(e.name);
         return QString();
     case Qt::EditRole:
-        if (col == 0) return e.name;
+        if (col == 0) return e.isDir ? e.name : QFileInfo(e.path).fileName();   // 平铺子文件夹时 name 是相对路径,改名只改文件名部分
         if (col == 3 && descr_ && !e.isDir) return descr_->get(e.name);
         return QVariant();
     case Qt::TextAlignmentRole:
@@ -227,6 +231,34 @@ QVariant FileListModel::headerData(int section, Qt::Orientation orientation, int
     return QVariant();
 }
 
+// 拖出去的数据:选中文件的路径(别的程序当作文件处理;Ctrl 复制、默认移动由对方决定)
+QStringList FileListModel::mimeTypes() const
+{
+    return QStringList() << QStringLiteral("text/uri-list");
+}
+
+QMimeData* FileListModel::mimeData(const QModelIndexList& indexes) const
+{
+    QList<QUrl> urls;
+    QSet<int> rows;
+    for (int i = 0; i < indexes.size(); ++i) {
+        const int r = indexes.at(i).row();
+        if (rows.contains(r)) continue;
+        rows.insert(r);
+        if (hasParentRow() && r == 0) continue;
+        urls << QUrl::fromLocalFile(entryAt(r).path);
+    }
+    if (urls.isEmpty()) return nullptr;
+    QMimeData* md = new QMimeData();
+    md->setUrls(urls);
+    return md;
+}
+
+Qt::DropActions FileListModel::supportedDragActions() const
+{
+    return Qt::CopyAction | Qt::MoveAction;
+}
+
 // 标志
 Qt::ItemFlags FileListModel::flags(const QModelIndex& index) const
 {
@@ -234,6 +266,7 @@ Qt::ItemFlags FileListModel::flags(const QModelIndex& index) const
     Qt::ItemFlags f = Qt::ItemIsEnabled | Qt::ItemIsSelectable;
     const bool isParent = hasParentRow() && index.row() == 0;
     if (index.column() == 0 && !isParent) f |= Qt::ItemIsEditable;
+    if (!isParent) f |= Qt::ItemIsDragEnabled;   // 可以把文件拖到资源管理器、聊天窗口、别的程序里
     if (index.column() == 3 && !isParent && descEditable_ && descr_ && !entryAt(index.row()).isDir) f |= Qt::ItemIsEditable;
     return f;
 }
@@ -257,7 +290,7 @@ bool FileListModel::setData(const QModelIndex& index, const QVariant& value, int
     }
     if (index.column() != 0) return false;
     const QString newName = value.toString().trimmed();
-    if (newName.isEmpty() || newName == e.name) return false;
+    if (newName.isEmpty() || newName == e.name || newName == QFileInfo(e.path).fileName()) return false;
     QString newPath;
     QString err;
     if (!FileOps::renameTo(e.path, newName, &newPath, &err)) {

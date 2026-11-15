@@ -4,6 +4,7 @@
 #include "core/FolderList.h"
 #include "core/Theme.h"
 #include "platform/FileAssoc.h"
+#include "core/Commands.h"
 
 #include <QColorDialog>
 #include <QPainter>
@@ -422,19 +423,10 @@ void OptionsDialog::onApply()
     emit optionsApplied();
 }
 
-// 设置文件关联(写 HKCU,用 Files/Extensions 里的列表)
+// 设置文件关联:和菜单里的"设置文件关联"是同一个命令(只维护一份流程)
 void OptionsDialog::onFileAssoc()
 {
-    if (QMessageBox::question(this, S("dlg.info.title"), S("dlg.assoc.confirm"),
-                              QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
-    const QStringList exts = FolderList::imageExtensions();
-    QString err;
-    if (!FileAssoc::registerAll(exts, &err)) {
-        QMessageBox::critical(this, S("err.title"), S("err.assoc").arg(err));
-        return;
-    }
-    FileAssoc::notifyShell();
-    QMessageBox::information(this, S("dlg.info.title"), S("dlg.assoc.done").arg(exts.size()));
+    Commands::instance().trigger(QStringLiteral("FileAssoc"));
 }
 
 // 颜色按钮被点击

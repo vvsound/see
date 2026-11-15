@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QStringList>
+#include <QIcon>
 #include <QString>
 
 #include "MainWindow.h"
@@ -13,12 +14,15 @@
 #include "core/Cli.h"
 #include "core/Theme.h"
 #include "core/CustomCommands.h"
+#include "core/FolderList.h"
+#include "platform/FileAssoc.h"
 
 // 程序入口:启动顺序见 PROGRESS.md 第 9 条
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("QuickView"));
+    app.setWindowIcon(QIcon(QStringLiteral(":/app.png")));   // 窗口左上角和任务栏的图标(exe 文件本身的图标在 resources/app.rc)
     // 图片格式插件:除了 Qt 自带位置,也认 exe 旁边的 imageformats\ 文件夹(放入插件 dll 即可支持新格式,不用重新编译)
     QCoreApplication::addLibraryPath(app.applicationDirPath());
 
@@ -44,6 +48,15 @@ int main(int argc, char* argv[])
         Config::fatal(error);
     }
     State::instance().load();
+
+    // 提权模式:由\"设置文件关联 → 所有用户\"启动,只写 HKLM 关联,不开窗口
+    if (app.arguments().contains(QStringLiteral("--assoc-machine"))) {
+        FileAssoc::setMachineWide(true);
+        QString assocErr;
+        const bool ok = FileAssoc::registerAll(FolderList::imageExtensions(), &assocErr);
+        if (ok) FileAssoc::notifyShell();
+        return ok ? 0 : 1;
+    }
 
     // 命令行路径;--new-window 表示本进程是\"新窗口\"打开方式启动的,不转交给已有实例
     QStringList paths = app.arguments();

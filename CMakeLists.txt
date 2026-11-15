@@ -61,8 +61,16 @@ set(QV_SOURCES
     src/ui/ExtensionsDialog.cpp
     src/platform/FileAssoc.h
     src/platform/FileAssoc.cpp
+    src/platform/Shell.h
+    src/platform/Shell.cpp
     resources/resources.qrc
 )
+
+# Windows 资源(exe 图标 + 版本信息)
+if(WIN32)
+    enable_language(RC)
+    list(APPEND QV_SOURCES resources/app.rc)
+endif()
 
 add_executable(QuickView WIN32 ${QV_SOURCES})
 target_include_directories(QuickView PRIVATE ${CMAKE_SOURCE_DIR}/src)

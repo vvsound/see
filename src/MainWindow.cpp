@@ -12,6 +12,8 @@
 #include <QMenu>
 #include <QStatusBar>
 #include <QMessageBox>
+#include <QPushButton>
+#include <QCheckBox>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QDir>
@@ -44,6 +46,7 @@
 #include "core/DescriptIon.h"
 #include "core/ThumbnailCache.h"
 #include "platform/FileAssoc.h"
+#include "platform/Shell.h"
 #include "ui/OptionsDialog.h"
 #include "ui/ExtensionsDialog.h"
 
@@ -96,6 +99,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     stack_ = new QStackedWidget(this);
     browser_ = new BrowserWidget(stack_);
+    browser_->folderList()->setIncludeSubfolders(State::instance().getBool(QStringLiteral("browser.includeSubfolders"), false));   // 上次是否开着"包含子文件夹"
     viewer_ = new ViewerWidget(stack_);
     stack_->addWidget(browser_);
     stack_->addWidget(viewer_);
@@ -146,6 +150,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(browser_, &BrowserWidget::focusAreaChanged, this, [this]() { updateHint(); });
     connect(browser_, &BrowserWidget::commandRequested, this, &MainWindow::onCommandRequested);
     connect(browser_, &BrowserWidget::contextMenuRequested, this, &MainWindow::onContextMenu);
+    connect(browser_, &BrowserWidget::treeContextMenuRequested, this, &MainWindow::onTreeContextMenu);
     connect(viewer_, &ViewerWidget::zoomChanged, this, &MainWindow::onViewerZoomChanged);
     connect(viewer_, &ViewerWidget::commandRequested, this, &MainWindow::onCommandRequested);
     connect(viewer_, &ViewerWidget::contextMenuRequested, this, &MainWindow::onContextMenu);
@@ -347,6 +352,62 @@ void MainWindow::onContextMenu(const QPoint& globalPos)
     menu.exec(globalPos);
 }
 
+// 左边文件夹树的右键菜单:对被点的那个文件夹操作(打开、重命名、新建子文件夹、删除、在资源管理器中显示)
+void MainWindow::onTreeContextMenu(const QString& path, const QPoint& globalPos)
+{
+    Commands& cmds = Commands::instance();
+    const QString cur = QDir::cleanPath(browser_->currentFolder());
+    const QString p = QDir::cleanPath(path);
+    const bool isRoot = QFileInfo(path).isRoot();
+    QMenu menu(this);
+    QAction* aOpen = menu.addAction(S("tree.menu.open"));
+    menu.addSeparator();
+    QAction* aRename = menu.addAction(cmds.iconFor(QStringLiteral("Rename")), cmds.nameOf(QStringLiteral("Rename")));
+    QAction* aNew = menu.addAction(cmds.iconFor(QStringLiteral("NewFolder")), cmds.nameOf(QStringLiteral("NewFolder")));
+    QAction* aDel = menu.addAction(cmds.iconFor(QStringLiteral("Delete")), cmds.nameOf(QStringLiteral("Delete")));
+    menu.addSeparator();
+    QAction* aExp = menu.addAction(cmds.iconFor(QStringLiteral("ShowInExplorer")), cmds.nameOf(QStringLiteral("ShowInExplorer")));
+    QAction* aRef = menu.addAction(cmds.iconFor(QStringLiteral("Refresh")), cmds.nameOf(QStringLiteral("Refresh")));
+    aRename->setEnabled(!isRoot);   // 盘符不能改名、删除
+    aDel->setEnabled(!isRoot);
+    QAction* r = menu.exec(globalPos);
+    if (r == nullptr) return;
+    const bool curIsThisOrInside = (cur.compare(p, Qt::CaseInsensitive) == 0) || cur.startsWith(p + QLatin1Char('/'), Qt::CaseInsensitive);
+    QString err;
+    if (r == aOpen) {
+        browser_->openFolder(path);
+    } else if (r == aRename) {
+        QString newPath;
+        if (!FileOps::renameWithDialog(this, path, &newPath, &err)) {
+            if (!err.isEmpty()) showError(err);
+            return;
+        }
+        // 当前正好在这个文件夹里(或它的子文件夹里):改名后跟着去新位置
+        QString target = browser_->currentFolder();
+        if (curIsThisOrInside) target = newPath + cur.mid(p.size());
+        browser_->refreshTree();
+        if (curIsThisOrInside) browser_->openFolder(target);
+        else browser_->refresh();
+    } else if (r == aNew) {
+        if (createFolderIn(path)) {
+            browser_->refreshTree();
+            if (cur.compare(p, Qt::CaseInsensitive) == 0) browser_->refresh();
+        }
+    } else if (r == aDel) {
+        if (!FileOps::deleteFiles(this, QStringList() << path, &err)) {
+            if (!err.isEmpty()) showError(err);
+            return;
+        }
+        if (curIsThisOrInside) browser_->openFolder(QFileInfo(path).absolutePath());   // 当前所在的文件夹没了:退到上一级
+        browser_->refreshTree();
+    } else if (r == aExp) {
+        if (!Shell::showInExplorer(path)) showError(S("err.showInExplorer").arg(QDir::toNativeSeparators(path)));
+    } else if (r == aRef) {
+        browser_->refreshTree();
+        browser_->refresh();
+    }
+}
+
 // 文件夹列表内容变化:查看模式下重建翻页列表
 void MainWindow::onFolderListChanged()
 {
@@ -535,6 +596,9 @@ void MainWindow::registerHandlers()
     c.setHandler(QStringLiteral("CutFile"), [this]() { cmdCutFile(); });
     c.setHandler(QStringLiteral("Paste"), [this]() { cmdPaste(); });
     c.setHandler(QStringLiteral("NewFolder"), [this]() { cmdNewFolder(); });
+    c.setHandler(QStringLiteral("IncludeSubfolders"), [this]() { cmdToggleSubfolders(); });
+    c.setHandler(QStringLiteral("ShowInExplorer"), [this]() { cmdShowInExplorer(); });
+    c.setHandler(QStringLiteral("SetWallpaper"), [this]() { cmdSetWallpaper(); });
     c.setHandler(QStringLiteral("ThumbReset"), [this]() { browser_->resetThumbSize(); });
     c.setHandler(QStringLiteral("CopyImageSel"), [this]() { cmdCopyImage(); });
     c.setHandler(QStringLiteral("EditDescription"), [this]() { cmdEditDescription(); });
@@ -1214,33 +1278,95 @@ void MainWindow::cmdPaste()
     const QByteArray effect = md->data(QStringLiteral("Preferred DropEffect"));
     const bool move = !effect.isEmpty() && effect.at(0) == 2;  // 2 = 剪切
     QString err;
-    if (!FileOps::copyOrMove(this, paths, browser_->currentFolder(), move, &err)) {
-        if (!err.isEmpty()) showError(err);
-        browser_->folderList()->refresh();
-        return;
-    }
-    if (move) QApplication::clipboard()->clear();
+    QStringList created;
+    const bool ok = FileOps::copyOrMove(this, paths, browser_->currentFolder(), move, &err, &created);
+    if (ok && move) QApplication::clipboard()->clear();
+    if (!ok && !err.isEmpty()) showError(err);
     browser_->folderList()->refresh();
+    // 粘贴出来的副本直接选中:接着按 F2 就能改名
+    if (!created.isEmpty()) {
+        browser_->selectPath(created.last());
+        browser_->focusFileArea();
+    }
+}
+
+// 包含子文件夹:把所有子文件夹里的图片平铺进当前列表(当唯一的看图软件,翻整个相册不用一层层点进去)
+void MainWindow::cmdToggleSubfolders()
+{
+    const bool on = Commands::instance().action(QStringLiteral("IncludeSubfolders"))->isChecked();
+    State::instance().setBool(QStringLiteral("browser.includeSubfolders"), on);
+    FolderList* fl = browser_->folderList();
+    fl->setIncludeSubfolders(on);
+    if (on && fl->subfoldersTruncated()) showError(S("msg.subTruncated").arg(FolderList::subfolderLimit()));
+}
+
+// 在资源管理器里显示(浏览:选中项;查看:当前图)
+void MainWindow::cmdShowInExplorer()
+{
+    QString path;
+    if (mode_ == WindowMode::Viewer) {
+        path = currentPath_;
+    } else {
+        const QStringList t = targetPaths();
+        path = t.isEmpty() ? browser_->currentFolder() : t.first();
+    }
+    if (path.isEmpty()) return;
+    if (!Shell::showInExplorer(path)) showError(S("err.showInExplorer").arg(QDir::toNativeSeparators(path)));
+}
+
+// 设为桌面壁纸:jpg/png/bmp 直接用原文件;别的格式先转成 png 放到 QuickView.state 旁边的 wallpaper.png
+void MainWindow::cmdSetWallpaper()
+{
+    QString path;
+    if (mode_ == WindowMode::Viewer) {
+        path = currentPath_;
+    } else {
+        const QStringList t = targetPaths();
+        if (!t.isEmpty()) path = t.first();
+    }
+    if (path.isEmpty() || !FolderList::isImagePath(path)) return;
+    QString use = path;
+    if (!Shell::wallpaperDirectOk(path)) {
+        LoadResult r;
+        if (!ImageLoader::instance().getCached(path, &r)) r = ImageLoader::instance().loadNow(path);
+        if (!r.ok) {
+            showError(S("err.wallpaper").arg(r.error));
+            return;
+        }
+        use = QFileInfo(State::statePath()).absolutePath() + QStringLiteral("/wallpaper.png");
+        if (!r.image.save(use, "PNG")) {
+            showError(S("err.wallpaper").arg(QDir::toNativeSeparators(use)));
+            return;
+        }
+    }
+    QString err;
+    if (!Shell::setWallpaper(use, &err)) showError(S("err.wallpaper").arg(err));
 }
 
 // 新建文件夹:在当前文件夹里建一个子文件夹
 void MainWindow::cmdNewFolder()
 {
     if (mode_ != WindowMode::Browser) return;
+    if (createFolderIn(browser_->currentFolder())) browser_->refresh();
+}
+
+// 在指定文件夹里新建子文件夹(弹出输入名字);成功返回 true
+bool MainWindow::createFolderIn(const QString& dirPath)
+{
     bool ok = false;
     const QString name = QInputDialog::getText(this, S("dlg.newfolder.title"), S("dlg.newfolder.label"), QLineEdit::Normal,
                                                S("dlg.newfolder.default"), &ok).trimmed();
-    if (!ok || name.isEmpty()) return;
-    QDir dir(browser_->currentFolder());
+    if (!ok || name.isEmpty()) return false;
+    QDir dir(dirPath);
     if (QFileInfo::exists(dir.absoluteFilePath(name))) {
         showError(S("err.folderExists").arg(QDir::toNativeSeparators(dir.absoluteFilePath(name))));
-        return;
+        return false;
     }
     if (!dir.mkdir(name)) {
         showError(S("err.mkdir").arg(QDir::toNativeSeparators(dir.absoluteFilePath(name))));
-        return;
+        return false;
     }
-    browser_->refresh();
+    return true;
 }
 
 // 剪切文件到剪贴板
@@ -1394,19 +1520,32 @@ void MainWindow::cmdManageExtensions()
     if (dlg.exec() == QDialog::Accepted) browser_->folderList()->refresh();
 }
 
-// 设置文件关联
+// 设置文件关联:让所有图片扩展名都用本程序打开
 void MainWindow::cmdFileAssoc()
 {
-    if (QMessageBox::question(this, S("dlg.info.title"), S("dlg.assoc.confirm"),
-                              QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
     const QStringList exts = FolderList::imageExtensions();
+    QMessageBox box(QMessageBox::Question, S("dlg.info.title"), S("dlg.assoc.confirm").arg(exts.size()), QMessageBox::NoButton, this);
+    QCheckBox* allUsers = new QCheckBox(S("dlg.assoc.allUsers"), &box);
+    box.setCheckBox(allUsers);
+    QPushButton* yes = box.addButton(S("dlg.assoc.yes"), QMessageBox::AcceptRole);
+    box.addButton(S("dlg.assoc.no"), QMessageBox::RejectRole);
+    box.setDefaultButton(yes);
+    box.exec();
+    if (box.clickedButton() != yes) return;
+
     QString err;
-    if (!FileAssoc::registerAll(exts, &err)) {
+    if (!FileAssoc::registerAll(exts, &err)) {            // 当前用户(HKCU)
         showError(S("err.assoc").arg(err));
         return;
     }
+    if (allUsers->isChecked()) {                          // 本机所有用户(HKLM),要管理员确认
+        QString err2;
+        if (!FileAssoc::registerAllUsers(&err2)) showError(S("err.assocAll").arg(err2));
+    }
+    const int cleared = FileAssoc::clearUserChoice(exts); // 去掉系统里以前选过的\"默认应用\",否则压住上面的注册
     FileAssoc::notifyShell();
-    QMessageBox::information(this, S("dlg.info.title"), S("dlg.assoc.done").arg(exts.size()));
+    QMessageBox::information(this, S("dlg.info.title"), S("dlg.assoc.done").arg(exts.size()).arg(cleared));
+    FileAssoc::openDefaultAppsSettings();                 // 打开系统默认应用页,方便最后确认
 }
 
 // 关于
@@ -1426,6 +1565,7 @@ void MainWindow::syncCheckStates()
     c.action(QStringLiteral("ToggleMenu"))->setChecked(cfg.getBool(b ? QStringLiteral("Browse/ShowMenu") : QStringLiteral("Viewer/ShowMenu")));
     c.action(QStringLiteral("TogglePathBar"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowPathBar")));
     c.action(QStringLiteral("ToggleTree"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowTree")));
+    c.action(QStringLiteral("IncludeSubfolders"))->setChecked(State::instance().getBool(QStringLiteral("browser.includeSubfolders"), false));
     c.action(QStringLiteral("TogglePreview"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowPreview")));
     c.action(QStringLiteral("ToggleInfo"))->setChecked(cfg.getBool(QStringLiteral("Browse/ShowInfoPanel")));
     c.action(QStringLiteral("ToggleInfoPreview"))->setChecked(cfg.getBool(QStringLiteral("Info/ShowPreview")));

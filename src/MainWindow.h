@@ -50,6 +50,8 @@ private slots:
     void onViewerZoomChanged(double zoom);
     // 弹出右键菜单
     void onContextMenu(const QPoint& globalPos);
+    void onTreeContextMenu(const QString& path, const QPoint& globalPos);
+    bool createFolderIn(const QString& dirPath);
     // 文件夹列表内容变化(文件被删/新增)
     void onFolderListChanged();
     // 全屏时隐藏光标的计时器
@@ -130,6 +132,9 @@ private:
     void cmdCutFile();
     void cmdPaste();
     void cmdNewFolder();
+    void cmdToggleSubfolders();
+    void cmdShowInExplorer();
+    void cmdSetWallpaper();
     // 编辑文件描述(descript.ion)
     void cmdEditDescription();
     // 重新载入当前图(不用缓存)

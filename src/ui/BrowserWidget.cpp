@@ -29,6 +29,10 @@
 #include <algorithm>
 #include <QStandardPaths>
 #include <QFileIconProvider>
+#include <QDrag>
+#include <QMimeData>
+#include <QPointer>
+#include <QTimer>
 
 namespace {
 
@@ -43,11 +47,29 @@ QString bytesText(qint64 bytes)
     return S("status.sizeGB").arg(QString::number(mb / 1024.0, 'f', 1));
 }
 
+// 改名时只选中文件名主体(不含 .jpg 等扩展名),不会一不小心把扩展名也删了
+class NameEditDelegate : public QStyledItemDelegate {
+public:
+    explicit NameEditDelegate(QObject* parent) : QStyledItemDelegate(parent) {}
+    void setEditorData(QWidget* editor, const QModelIndex& index) const override
+    {
+        QStyledItemDelegate::setEditorData(editor, index);
+        QLineEdit* le = qobject_cast<QLineEdit*>(editor);
+        if (le == nullptr || index.data(FileListModel::IsDirRole).toBool()) return;
+        const int dot = le->text().lastIndexOf(QLatin1Char('.'));
+        if (dot <= 0) return;
+        QPointer<QLineEdit> guard(le);
+        QTimer::singleShot(0, le, [guard, dot]() {   // 等编辑框显示完再选,否则会被"全选"盖掉
+            if (!guard.isNull()) guard->setSelection(0, dot);
+        });
+    }
+};
+
 // 缩略图方式的单元格绘制:上面缩略图,下面(缩略图+信息方式)宽x高x色深和文件名
-class ThumbDelegate : public QStyledItemDelegate {
+class ThumbDelegate : public NameEditDelegate {
 public:
     explicit ThumbDelegate(QObject* parent)
-        : QStyledItemDelegate(parent), withText_(true), border_(6), showArea_(true), showSize_(false),
+        : NameEditDelegate(parent), withText_(true), border_(6), showArea_(true), showSize_(false),
           cellRadius_(8), imageRadius_(4), imageBorder_(false), hover_(true), focusWidth_(2) {}
 
     // 外观:圆角/边框/悬停/焦点框粗细来自 ini,颜色来自主题(取不到主题变量会直接报错)
@@ -280,9 +302,16 @@ void BrowserWidget::buildUi()
     listView_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     listView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     listView_->setModelColumn(0);
+    listView_->setMovement(QListView::Static);                 // 缩略图不能在窗口里被拖着乱放
+    for (QAbstractItemView* v : {static_cast<QAbstractItemView*>(listView_), static_cast<QAbstractItemView*>(detailView_)}) {
+        v->setDragEnabled(true);                               // 可以拖出去:到资源管理器、别的程序
+        v->setDragDropMode(QAbstractItemView::DragOnly);
+        v->setDefaultDropAction(Qt::CopyAction);
+    }
 
     thumbDelegate_ = new ThumbDelegate(this);
-    plainDelegate_ = new QStyledItemDelegate(this);
+    plainDelegate_ = new NameEditDelegate(this);
+    detailView_->setItemDelegate(new NameEditDelegate(this));
 
     viewStack_->addWidget(listView_);
     viewStack_->addWidget(detailView_);
@@ -305,13 +334,18 @@ void BrowserWidget::buildUi()
     detailView_->installEventFilter(this);
     pathBox_->lineEdit()->installEventFilter(this);
 
-    // 右键:在视口上用自定义菜单策略
-    listView_->viewport()->setContextMenuPolicy(Qt::CustomContextMenu);
-    detailView_->viewport()->setContextMenuPolicy(Qt::CustomContextMenu);
+    // 右键:自定义菜单策略必须设在视图本身上(设在 viewport 上不会发出信号,右键就没有任何反应);
+    // 视口上的事件过滤只用来在右键按下时先选中被点的项
+    listView_->setContextMenuPolicy(Qt::CustomContextMenu);
+    detailView_->setContextMenuPolicy(Qt::CustomContextMenu);
     listView_->viewport()->installEventFilter(this);
     detailView_->viewport()->installEventFilter(this);
-    connect(listView_->viewport(), &QWidget::customContextMenuRequested, this, &BrowserWidget::onContextMenuRequested);
-    connect(detailView_->viewport(), &QWidget::customContextMenuRequested, this, &BrowserWidget::onContextMenuRequested);
+    connect(listView_, &QWidget::customContextMenuRequested, this, &BrowserWidget::onContextMenuRequested);
+    connect(detailView_, &QWidget::customContextMenuRequested, this, &BrowserWidget::onContextMenuRequested);
+
+    // 文件夹树右键:弹出文件夹菜单(重命名、新建、删除等)
+    tree_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(tree_, &QWidget::customContextMenuRequested, this, &BrowserWidget::onTreeContextMenu);
 
     connect(tree_, &QTreeView::expanded, this, &BrowserWidget::onTreeExpanded);
     connect(tree_, &QTreeView::clicked, this, &BrowserWidget::onTreeClicked);
@@ -519,6 +553,26 @@ void BrowserWidget::refresh()
     ThumbnailCache::instance().clearMemory();
     model_->clearFailed();
     folderList_->refresh();
+}
+
+// 重建文件夹树并定位到当前文件夹
+void BrowserWidget::refreshTree()
+{
+    rebuildTree();
+    syncTreeTo(folderList_->folder());
+}
+
+// 树里右键:选中被点的文件夹(不跳转),让主窗口弹菜单
+void BrowserWidget::onTreeContextMenu(const QPoint& pos)
+{
+    const QModelIndex idx = tree_->indexAt(pos);
+    if (!idx.isValid()) return;
+    const QString p = idx.data(Qt::UserRole + 1).toString();
+    if (p.isEmpty()) return;   // 虚拟节点(此电脑、库)没有菜单
+    syncingTree_ = true;
+    tree_->setCurrentIndex(idx);
+    syncingTree_ = false;
+    emit treeContextMenuRequested(p, tree_->viewport()->mapToGlobal(pos));
 }
 
 // 上一级:光标落在刚离开的那个文件夹上
@@ -1032,6 +1086,8 @@ bool BrowserWidget::eventFilter(QObject* obj, QEvent* e)
             QAbstractItemView* v = (obj == listView_->viewport()) ? static_cast<QAbstractItemView*>(listView_)
                                                                   : static_cast<QAbstractItemView*>(detailView_);
             const QModelIndex idx = v->indexAt(me->pos());
+            rightPressPos_ = me->pos();
+            rightDragArmed_ = idx.isValid() && !idx.sibling(idx.row(), 0).data(FileListModel::IsParentRole).toBool();
             if (idx.isValid()) {
                 if (!detailView_->selectionModel()->isSelected(idx.sibling(idx.row(), 0))) {
                     detailView_->selectionModel()->setCurrentIndex(idx.sibling(idx.row(), 0),
@@ -1042,7 +1098,43 @@ bool BrowserWidget::eventFilter(QObject* obj, QEvent* e)
             }
         }
     }
+    // 右键拖动:按住右键把文件拖到资源管理器/桌面,松开时由对方弹出"复制到此处/移动到此处"菜单
+    if (e->type() == QEvent::MouseMove) {
+        QMouseEvent* me = static_cast<QMouseEvent*>(e);
+        if (rightDragArmed_ && (me->buttons() & Qt::RightButton) != 0
+            && (me->pos() - rightPressPos_).manhattanLength() >= QApplication::startDragDistance()) {
+            rightDragArmed_ = false;
+            startFileDrag();
+            return true;
+        }
+    } else if (e->type() == QEvent::MouseButtonRelease) {
+        rightDragArmed_ = false;
+    }
     return QWidget::eventFilter(obj, e);
+}
+
+// 开始把选中的文件拖出去(右键拖动用;左键拖动由视图自带的拖出处理)
+void BrowserWidget::startFileDrag()
+{
+    const QStringList paths = selectedPaths();
+    if (paths.isEmpty()) return;
+    QList<QUrl> urls;
+    for (int i = 0; i < paths.size(); ++i) urls << QUrl::fromLocalFile(paths.at(i));
+    QMimeData* md = new QMimeData();
+    md->setUrls(urls);
+    QDrag* drag = new QDrag(this);
+    drag->setMimeData(md);
+    const QModelIndex cur = activeView()->currentIndex();
+    const QVariant dec = cur.sibling(cur.row(), 0).data(Qt::DecorationRole);
+    QPixmap pm;
+    if (dec.canConvert<QIcon>()) pm = qvariant_cast<QIcon>(dec).pixmap(48, 48);
+    else if (dec.canConvert<QPixmap>()) pm = qvariant_cast<QPixmap>(dec);
+    if (!pm.isNull()) {
+        drag->setPixmap(pm);
+        drag->setHotSpot(QPoint(pm.width() / 2, pm.height() / 2));
+    }
+    drag->exec(Qt::CopyAction | Qt::MoveAction | Qt::LinkAction, Qt::CopyAction);
+    folderList_->refresh();   // 对方如果选了"移动",文件已经不在这里了
 }
 
 // 树里点击了文件夹
@@ -1199,9 +1291,9 @@ void BrowserWidget::onPreviewTimer()
 // 右键:通知主窗口弹菜单
 void BrowserWidget::onContextMenuRequested(const QPoint& pos)
 {
-    QWidget* w = qobject_cast<QWidget*>(sender());
+    QAbstractScrollArea* w = qobject_cast<QAbstractScrollArea*>(sender());
     if (w == nullptr) return;
-    emit contextMenuRequested(w->mapToGlobal(pos));
+    emit contextMenuRequested(w->viewport()->mapToGlobal(pos));   // pos 是视口坐标
 }
 
 // 当前显示的视图

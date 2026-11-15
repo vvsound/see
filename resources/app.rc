@@ -1,0 +1,31 @@
+// Windows 资源:exe 内嵌图标 + 版本信息(默认应用列表、任务栏、资源管理器都靠它显示图标和名字)
+// 只用 ASCII,避免 rc.exe 的代码页问题;中文名在 FileAssoc.cpp 里写进注册表(FriendlyAppName)
+IDI_APPICON ICON "app.ico"
+
+1 VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "MoonView"
+            VALUE "FileDescription", "XView Image Viewer"
+            VALUE "FileVersion", "0.1.0.0"
+            VALUE "InternalName", "XView"
+            VALUE "OriginalFilename", "QuickView.exe"
+            VALUE "ProductName", "XView"
+            VALUE "ProductVersion", "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

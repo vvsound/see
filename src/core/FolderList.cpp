@@ -4,6 +4,7 @@
 #include "ImageLoader.h"
 
 #include <QDir>
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QCollator>
 #include <QSet>
@@ -299,7 +300,56 @@ bool FolderList::scan(QString* error)
         e.isImage = !e.isDir && hasImageExt(e.name, exts);
         all_.append(e);
     }
+    subTruncated_ = false;
+    if (includeSub_) {
+        // 平铺:把所有子文件夹里的图片收进来(只收图片,文件夹仍只显示当前这一层),名字显示成相对路径
+        const bool showHidden = Config::instance().getBool(QStringLiteral("FileList/ShowHidden"));
+        QDir::Filters f = QDir::Files | QDir::NoDotAndDotDot;
+        if (showHidden) f |= QDir::Hidden;
+        QDirIterator it(folder_, f, QDirIterator::Subdirectories);
+        const QString base = QDir::cleanPath(folder_) + QLatin1Char('/');
+        int added = 0;
+        while (it.hasNext()) {
+            it.next();
+            const QFileInfo fi = it.fileInfo();
+            if (fi.absolutePath() == QDir::cleanPath(folder_)) continue;   // 当前这一层上面已经收过了
+            if (!hasImageExt(fi.fileName(), exts)) continue;
+            if (!showHidden && fi.isHidden()) continue;
+            if (++added > subfolderLimit()) { subTruncated_ = true; break; }
+            FileEntry e;
+            e.path = fi.absoluteFilePath();
+            QString rel = e.path;
+            if (rel.startsWith(base, Qt::CaseInsensitive)) rel = rel.mid(base.size());
+            e.name = rel;                 // 例如 2024/旅行/IMG_001.jpg
+            e.isDir = false;
+            e.isHidden = fi.isHidden();
+            e.isExtra = false;
+            e.size = fi.size();
+            e.modified = fi.lastModified();
+            e.isImage = true;
+            all_.append(e);
+        }
+    }
     return true;
+}
+
+// 平铺子文件夹开关
+void FolderList::setIncludeSubfolders(bool on)
+{
+    if (includeSub_ == on) return;
+    includeSub_ = on;
+    if (!folder_.isEmpty()) refresh();
+}
+
+bool FolderList::includeSubfolders() const
+{
+    return includeSub_;
+}
+
+// 平铺时最多收的文件数
+int FolderList::subfolderLimit()
+{
+    return 30000;
 }
 
 // 按选项过滤并排序,生成 entries_

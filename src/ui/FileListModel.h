@@ -1,5 +1,6 @@
 #pragma once
 #include <QAbstractTableModel>
+#include <QMimeData>
 #include <QString>
 #include <QIcon>
 #include <QFileIconProvider>
@@ -45,6 +46,9 @@ public:
     QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
     // 标志(可编辑:名称列、描述列)
     Qt::ItemFlags flags(const QModelIndex& index) const override;
+    QStringList mimeTypes() const override;
+    QMimeData* mimeData(const QModelIndexList& indexes) const override;
+    Qt::DropActions supportedDragActions() const override;
     // 编辑(重命名/描述)
     bool setData(const QModelIndex& index, const QVariant& value, int role) override;
     // 某行对应的文件项(".." 行返回空项)
