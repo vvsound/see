@@ -61,6 +61,8 @@ set(QV_SOURCES
     src/ui/ExtensionsDialog.cpp
     src/platform/FileAssoc.h
     src/platform/FileAssoc.cpp
+    src/platform/Shell.h
+    src/platform/Shell.cpp
     resources/resources.qrc
 )
 
