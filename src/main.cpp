@@ -661,6 +661,7 @@ struct Button {
 struct App {
     HWND hwnd = nullptr;
     std::wstring root;
+    std::string dblPending;   // 双击要执行的命令,等鼠标松开
     Ini cfg, loc, nat;
     Theme th;
     std::map<std::string, std::string> iconOf;
@@ -1226,6 +1227,7 @@ struct App {
             name = fmtArgs(tr("app.titleFormat", "%1 - Xview"), U(p));
         }
         SetWindowTextW(hwnd, W(name).c_str());
+        reportState(false);
     }
 
     // ---------------- 命令
@@ -1470,6 +1472,18 @@ struct App {
         x = wa.left + ((wa.right - wa.left) - w) / 2;
         y = wa.top + ((wa.bottom - wa.top) - h) / 2;
     }
+    // 把"正在看哪张 / 是否已退出"写进 data\config\native_last.txt,目录页(Xdir)读它来同步选中项。
+    // 第一行 open 或 closed,第二行完整路径。先写临时文件再替换,读的一方不会读到半截。
+    void reportState(bool closed) {
+        if (idx < 0 || idx >= (int)files.size()) return;
+        CreateDirectoryW((root + L"\\data").c_str(), nullptr);
+        CreateDirectoryW((root + L"\\data\\config").c_str(), nullptr);
+        std::wstring f = root + L"\\data\\config\\native_last.txt";
+        std::wstring t = f + L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+        writeFileText(t, std::string(closed ? "closed" : "open") + "\n" + U(files[idx]) + "\n");
+        MoveFileExW(t.c_str(), f.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+
     void saveState() {
         if (!cfg.getBool("Viewer/SaveWindowPos", true)) return;
         if (fullscreen) setFullscreen(false);
@@ -1602,6 +1616,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (a->hotBtn != -1) { a->hotBtn = -1; a->invalidate(); }
             return 0;
         case WM_LBUTTONUP: {
+            if (!a->dblPending.empty()) {
+                std::string cmd = a->dblPending;
+                a->dblPending.clear();
+                ReleaseCapture();
+                a->run(cmd);
+                return 0;
+            }
             if (a->dragging) { a->dragging = false; ReleaseCapture(); return 0; }
             if (a->downBtn >= 0) {
                 int b = a->buttonAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
@@ -1613,8 +1634,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        case WM_LBUTTONDBLCLK: {
-            if (GET_Y_LPARAM(lp) >= a->tbH()) a->run(a->cfg.get("Mouse/DoubleClick"));
+        case WM_LBUTTONDBLCLK: {   // 双击的命令(例如退出)等鼠标松开再执行:不然松开的那一下会落到下面的窗口上,把对方弄成"按住拖拽"的状态
+            if (GET_Y_LPARAM(lp) >= a->tbH()) { a->dblPending = a->cfg.get("Mouse/DoubleClick"); SetCapture(hwnd); }
             return 0;
         }
         case WM_RBUTTONUP: {
@@ -1654,6 +1675,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return FALSE;
         }
         case WM_CLOSE:
+            a->reportState(true);
             a->saveState();
             DestroyWindow(hwnd);
             return 0;
