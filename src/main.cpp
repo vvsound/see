@@ -812,9 +812,9 @@ const char* const kCmds[] = {
     "CopyTo", "MoveTo", "Rename", "Undo", "SetWallpaper", "Print",
     "ToggleToolbar", "ToggleStatusBar", "ToggleMenu", "ToggleKeyHints", "ToggleFilmstrip", "ToggleSlideshow",
     "About",
-    // 下面这些要用 Xdir(评分/色标/收藏存在 SQLite 里,选项窗口是 Qt 写的):原生版把命令交给 Xdir 去办
+    // 下面这些要用 Xdir(色标/收藏存在 SQLite 里,选项窗口是 Qt 写的):原生版把命令交给 Xdir 去办
     "Options", "ManageExtensions", "FileAssoc", "FileUnassoc", "CommandPalette",
-    "Rate0", "Rate1", "Rate2", "Rate3", "Rate4", "Rate5", "LabelRed", "LabelYellow", "LabelGreen", "LabelBlue",
+    "LabelRed", "LabelYellow", "LabelGreen", "LabelBlue",
     "ToggleFavorite", "ShowFavorites",
     "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"};
 
@@ -2352,10 +2352,9 @@ struct App {
         MessageBoxW(hwnd, L"Xview 原生看图\n\n纯 C++ / Direct2D,启动快、不依赖运行库。\n配置与 Xdir 共用 data\\config\\settings.ini。", L"关于 Xview", MB_OK | MB_ICONINFORMATION);
     }
 
-    // ---------------- 交给 Xdir 办的命令(评分/色标/收藏存在 Xdir 的 SQLite 里,选项窗口是 Qt 写的)
+    // ---------------- 交给 Xdir 办的命令(色标/收藏存在 Xdir 的 SQLite 里,选项窗口是 Qt 写的)
     static bool isXdirCmd(const std::string& c) {
         static const char* const k[] = {"Options", "ManageExtensions", "FileAssoc", "FileUnassoc", "CommandPalette",
-                                        "Rate0", "Rate1", "Rate2", "Rate3", "Rate4", "Rate5",
                                         "LabelRed", "LabelYellow", "LabelGreen", "LabelBlue", "ToggleFavorite", "ShowFavorites"};
         for (auto* x : k) if (c == x) return true;
         return false;
