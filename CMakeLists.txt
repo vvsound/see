@@ -21,4 +21,4 @@ target_compile_definitions(Xview PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NO
 target_compile_options(Xview PRIVATE /utf-8 /W3 /EHsc /O2)
 target_link_options(Xview PRIVATE /OPT:REF /OPT:ICF /MANIFEST:NO)
 target_include_directories(Xview PRIVATE src)
-target_link_libraries(Xview PRIVATE d2d1 dwrite windowscodecs ole32 oleaut32 user32 gdi32 shell32 shlwapi comdlg32 uuid)
+target_link_libraries(Xview PRIVATE d2d1 dwrite windowscodecs ole32 oleaut32 user32 gdi32 shell32 shlwapi comdlg32 winspool uuid d3d11 dxgi dwmapi comctl32 advapi32)

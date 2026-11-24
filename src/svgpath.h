@@ -22,6 +22,8 @@ struct SvgIcon {
     double vbX = 0, vbY = 0, vbW = 24, vbH = 24;
     double strokeWidth = 2;
     bool fill = false;          // 图标是否实心(fill 不是 none)
+    bool hasStroke = false;     // 图标文件自带描边颜色(Icons/Tint=0 时按它画)
+    unsigned stroke = 0;        // 0xRRGGBB
     std::vector<Path> paths;    // 每个元素一条(可含多个子路径)
 };
 
@@ -226,6 +228,19 @@ inline bool parseSvg(const std::string& text, SvgIcon& icon) {
     }
     icon.strokeWidth = numAttr(head, "stroke-width", 2);
     if (attrOf(head, "fill", v)) icon.fill = (v != "none");
+    if (attrOf(head, "stroke", v) && v.size() == 7 && v[0] == '#') {
+        unsigned c = 0;
+        bool good = true;
+        for (size_t i = 1; i < 7; ++i) {
+            char ch = v[i];
+            c <<= 4;
+            if (ch >= '0' && ch <= '9') c |= (unsigned)(ch - '0');
+            else if (ch >= 'a' && ch <= 'f') c |= (unsigned)(ch - 'a' + 10);
+            else if (ch >= 'A' && ch <= 'F') c |= (unsigned)(ch - 'A' + 10);
+            else { good = false; break; }
+        }
+        if (good) { icon.hasStroke = true; icon.stroke = c; }
+    }
     size_t pos = svgEnd;
     while ((pos = text.find('<', pos)) != std::string::npos) {
         size_t e = text.find('>', pos);

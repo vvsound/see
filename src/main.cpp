@@ -8,22 +8,28 @@
 // 目录布局:Xview.exe 放在项目根,旁边是 app\ 和 data\。
 #include <windows.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <commdlg.h>
 #include <d2d1_3.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d2d1.h>
 #include <d2d1helper.h>
+#include <dwmapi.h>
 #include <dwrite.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <sddl.h>
 #include <shlwapi.h>
 #include <wincodec.h>
+#include <winspool.h>
+#include <oleauto.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
@@ -47,6 +53,9 @@
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 using Microsoft::WRL::ComPtr;
 using namespace xv;
@@ -57,6 +66,11 @@ constexpr wchar_t kClass[] = L"XviewNativeWnd";
 constexpr UINT WM_APP_LOADED = WM_APP + 1;
 constexpr UINT_PTR TIMER_FLIP = 1;
 constexpr UINT_PTR TIMER_CURSOR = 2;
+constexpr UINT_PTR TIMER_SHOW = 3;    // 幻灯片放映
+constexpr UINT_PTR TIMER_ANIM = 4;    // GIF 动画
+constexpr UINT WM_APP_THUMB = WM_APP + 2;   // 胶片条缩略图生成好了
+constexpr UINT ID_MENU_BASE = 2000;   // 菜单栏 / 弹出菜单的命令编号起点
+constexpr ULONG_PTR kCopyDataPathAdd = 0x58564E32;   // 'XVN2':和 XVN1 一样交一个路径,但明确要求"添加到列表"
 constexpr ULONG_PTR kCopyDataPath = 0x58564E31;  // 'XVN1'
 
 // ------------------------------------------------------------------ 字符串 / 文件小工具
@@ -168,9 +182,16 @@ struct Loaded {
     unsigned long long fileSize = 0;
     double secs = 0;
     size_t bytes = 0;
+    std::vector<ComPtr<IWICBitmap>> frames;   // GIF 动画:每帧都是合成好的整幅画面(预乘 BGRA);只有 1 帧或不是 GIF 时为空
+    std::vector<int> delays;                  // 每帧停留的毫秒数
 };
 
 ComPtr<IWICImagingFactory> g_wic;
+
+// 解码线程要读的几个选项(主线程载入设置时写)
+std::atomic<int> g_rawMode{0};        // Viewer/RawMode:0=Auto 1=Preview 2=Develop
+std::atomic<double> g_gamma{0.0};     // Display/Gamma(0 = 不校正)
+std::atomic<bool> g_gifOff{false};    // Display/DisableGifAnimation
 
 bool queryOrientation(IWICBitmapFrameDecode* frame, int& o) {
     ComPtr<IWICMetadataQueryReader> mq;
@@ -342,6 +363,106 @@ bool shellThumb(const std::wstring& path, ComPtr<IWICBitmap>& out, UINT& outW, U
     return outW > 0 && outH > 0;
 }
 
+// γ 校正:输出 = 255 * (输入/255)^(1/γ)(γ>1 变亮)。返回 nullptr 表示不需要校正(或失败,调用者保留原图)
+ComPtr<IWICBitmap> applyGamma(IWICBitmap* in, double gamma) {
+    if (!in || gamma <= 0.0 || std::fabs(gamma - 1.0) < 1e-6) return nullptr;
+    UINT w = 0, h = 0;
+    in->GetSize(&w, &h);
+    if (!w || !h) return nullptr;
+    const UINT stride = w * 4;
+    std::vector<BYTE> px((size_t)stride * h);
+    WICRect rc = {0, 0, (INT)w, (INT)h};
+    if (FAILED(in->CopyPixels(&rc, stride, (UINT)px.size(), px.data()))) return nullptr;
+    BYTE lut[256];
+    for (int i = 0; i < 256; ++i) lut[i] = (BYTE)std::min(255L, std::lround(255.0 * std::pow(i / 255.0, 1.0 / gamma)));
+    for (size_t i = 0; i + 3 < px.size(); i += 4) {
+        BYTE a = px[i + 3];
+        if (a == 255) { px[i] = lut[px[i]]; px[i + 1] = lut[px[i + 1]]; px[i + 2] = lut[px[i + 2]]; }
+        else if (a > 0) {   // 预乘的像素:先还原、校正、再乘回去
+            for (int c = 0; c < 3; ++c) {
+                unsigned v = std::min(255u, (unsigned)px[i + c] * 255u / a);
+                px[i + c] = (BYTE)((unsigned)lut[v] * a / 255u);
+            }
+        }
+    }
+    ComPtr<IWICBitmap> out;
+    if (FAILED(g_wic->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppPBGRA, stride, (UINT)px.size(), px.data(), &out))) return nullptr;
+    return out;
+}
+
+UINT metaUInt(IWICMetadataQueryReader* q, const wchar_t* name, UINT def) {
+    if (!q) return def;
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    UINT v = def;
+    if (SUCCEEDED(q->GetMetadataByName(name, &pv))) {
+        if (pv.vt == VT_UI2) v = pv.uiVal;
+        else if (pv.vt == VT_UI1) v = pv.bVal;
+        else if (pv.vt == VT_UI4) v = pv.ulVal;
+    }
+    PropVariantClear(&pv);
+    return v;
+}
+
+// GIF 动画:把每一帧按"处置方式"合成到整幅画布上。帧数 <2、太大、读不出来都返回 false(调用者按普通静态图处理)
+bool decodeGifFrames(IWICBitmapDecoder* dec, Loaded& r, UINT& cw, UINT& ch) {
+    UINT fc = 0;
+    if (FAILED(dec->GetFrameCount(&fc)) || fc < 2) return false;
+    ComPtr<IWICMetadataQueryReader> dq;
+    dec->GetMetadataQueryReader(&dq);
+    cw = metaUInt(dq.Get(), L"/logscrdesc/Width", 0);
+    ch = metaUInt(dq.Get(), L"/logscrdesc/Height", 0);
+    if (!cw || !ch) {
+        ComPtr<IWICBitmapFrameDecode> f0;
+        if (FAILED(dec->GetFrame(0, &f0)) || FAILED(f0->GetSize(&cw, &ch))) return false;
+    }
+    if (!cw || !ch || cw > 16384 || ch > 16384) return false;
+    const size_t frameBytes = (size_t)cw * ch * 4;
+    if (frameBytes * fc > ((size_t)384 << 20)) return false;   // 帧太多太大:只显示第一帧,免得吃光内存
+    std::vector<BYTE> canvas(frameBytes, 0), saved;
+    std::vector<ComPtr<IWICBitmap>> frames;
+    std::vector<int> delays;
+    for (UINT i = 0; i < fc; ++i) {
+        ComPtr<IWICBitmapFrameDecode> f;
+        if (FAILED(dec->GetFrame(i, &f))) return false;
+        ComPtr<IWICMetadataQueryReader> mq;
+        f->GetMetadataQueryReader(&mq);
+        UINT left = metaUInt(mq.Get(), L"/imgdesc/Left", 0), top = metaUInt(mq.Get(), L"/imgdesc/Top", 0);
+        UINT delay = metaUInt(mq.Get(), L"/grctlext/Delay", 10), disp = metaUInt(mq.Get(), L"/grctlext/Disposal", 0);
+        UINT fw = 0, fh = 0;
+        if (FAILED(f->GetSize(&fw, &fh)) || !fw || !fh) return false;
+        ComPtr<IWICFormatConverter> cv;
+        if (FAILED(g_wic->CreateFormatConverter(&cv))) return false;
+        if (FAILED(cv->Initialize(f.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeMedianCut))) return false;
+        std::vector<BYTE> fp((size_t)fw * fh * 4);
+        WICRect rc = {0, 0, (INT)fw, (INT)fh};
+        if (FAILED(cv->CopyPixels(&rc, fw * 4, (UINT)fp.size(), fp.data()))) return false;
+        if (disp == 3) saved = canvas;
+        for (UINT y = 0; y < fh && top + y < ch; ++y) {
+            for (UINT x = 0; x < fw && left + x < cw; ++x) {
+                const BYTE* sp = &fp[((size_t)y * fw + x) * 4];
+                BYTE* dp = &canvas[((size_t)(top + y) * cw + (left + x)) * 4];
+                BYTE sa = sp[3];
+                if (sa == 255) std::memcpy(dp, sp, 4);
+                else if (sa) { unsigned inv = 255u - sa; for (int c = 0; c < 4; ++c) dp[c] = (BYTE)std::min(255u, sp[c] + (dp[c] * inv + 127u) / 255u); }
+            }
+        }
+        ComPtr<IWICBitmap> snap;
+        if (FAILED(g_wic->CreateBitmapFromMemory(cw, ch, GUID_WICPixelFormat32bppPBGRA, cw * 4, (UINT)frameBytes, canvas.data(), &snap))) return false;
+        frames.push_back(snap);
+        delays.push_back(delay <= 1 ? 100 : (int)delay * 10);   // 浏览器的惯例:10 毫秒以下按 100 毫秒算
+        if (disp == 2) {   // 处置 = 恢复背景:这一帧占的那块清成透明
+            for (UINT y = 0; y < fh && top + y < ch; ++y)
+                for (UINT x = 0; x < fw && left + x < cw; ++x) std::memset(&canvas[((size_t)(top + y) * cw + (left + x)) * 4], 0, 4);
+        } else if (disp == 3 && !saved.empty()) {
+            canvas = saved;
+        }
+    }
+    r.frames.swap(frames);
+    r.delays.swap(delays);
+    return true;
+}
+
 std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
     auto t0 = std::chrono::steady_clock::now();
     auto r = std::make_shared<Loaded>();
@@ -360,6 +481,7 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
     const bool isPsd = (ext == L"psd" || ext == L"psb"), isHdr = (ext == L"hdr"), isExr = (ext == L"exr"), isRaw = isRawExt(ext);
     const bool isSvg = (ext == L"svg" || ext == L"svgz"), isShell = (ext == L"ai" || ext == L"eps" || ext == L"cdr");
     ComPtr<IWICBitmapDecoder> dec;
+    bool rawPreview = false;   // 这张 RAW 是不是用的内嵌预览(是:方向以容器里的为准)
 
     auto useShell = [&]() -> bool {   // 向 Windows 要预览图,成功就当作"自己解码出来的"
         ComPtr<IWICBitmap> sb;
@@ -411,16 +533,41 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
         r->bits = im.bits;
         r->format = im.format;
         custom = true;
-    } else if (isRaw) {   // 相机 RAW:取文件里最大的内嵌 JPEG 预览
-        std::vector<uint8_t> blob;
-        if (!readAllBytes(path, blob)) return r;
-        size_t off = 0, len = 0;
-        if (!xcodec::findRawPreview(blob.data(), blob.size(), off, len)) { r->err = "这个 RAW 文件里没有找到内嵌的预览图"; return r; }
-        orient = xcodec::rawOrientation(blob.data(), blob.size());
-        ComPtr<IStream> st;
-        st.Attach(SHCreateMemStream(blob.data() + off, (UINT)len));   // 会复制一份,blob 可以释放
-        if (!st) return r;
-        if (FAILED(g_wic->CreateDecoderFromStream(st.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &dec))) return r;
+    } else if (isRaw) {
+        const int mode = g_rawMode.load();   // 0=Auto 1=Preview 2=Develop
+        ComPtr<IWICBitmapDecoder> pdec, sdec;
+        int porient = 1;
+        auto viaPreview = [&]() -> bool {   // 取文件里最大的内嵌 JPEG 预览
+            std::vector<uint8_t> blob;
+            if (!readAllBytes(path, blob)) return false;
+            size_t off = 0, len = 0;
+            if (!xcodec::findRawPreview(blob.data(), blob.size(), off, len)) return false;
+            porient = xcodec::rawOrientation(blob.data(), blob.size());
+            ComPtr<IStream> st;
+            st.Attach(SHCreateMemStream(blob.data() + off, (UINT)len));   // 会复制一份,blob 可以释放
+            if (!st) return false;
+            return SUCCEEDED(g_wic->CreateDecoderFromStream(st.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &pdec)) && pdec;
+        };
+        auto viaSystem = [&]() -> bool {   // 系统装了 RAW 解码器(Microsoft 原始图像扩展 / 相机厂商编解码器)时走它,得到完整分辨率
+            return SUCCEEDED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &sdec)) && sdec;
+        };
+        auto bigEnough = [&]() -> bool {   // Auto:预览有 200 万像素以上就够用
+            ComPtr<IWICBitmapFrameDecode> f0;
+            UINT pw = 0, ph = 0;
+            return pdec && SUCCEEDED(pdec->GetFrame(0, &f0)) && SUCCEEDED(f0->GetSize(&pw, &ph)) && (unsigned long long)pw * ph >= 2000000ULL;
+        };
+        bool havePrev = false;
+        if (mode != 2) havePrev = viaPreview();
+        if (mode == 2 || (mode == 0 && (!havePrev || !bigEnough()))) {
+            if (viaSystem()) { dec = sdec; rawPreview = false; }
+        }
+        if (!dec) {   // 系统没有 RAW 解码器(或模式要求只用预览):用内嵌预览
+            if (!havePrev) havePrev = viaPreview();
+            if (!havePrev) { r->err = "这个 RAW 文件里没有找到内嵌的预览图,系统里也没有能读它的 RAW 解码器"; return r; }
+            dec = pdec;
+            orient = porient;
+            rawPreview = true;
+        }
     } else {
         if (FAILED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) {
             if (!useShell()) return r;   // 系统解码器不认:最后问问 Windows 有没有预览图
@@ -430,7 +577,7 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
     if (!custom) {
         GUID cf;
         bool isIco = false;
-        if (SUCCEEDED(dec->GetContainerFormat(&cf)) && !isRaw) {
+        if (SUCCEEDED(dec->GetContainerFormat(&cf)) && !rawPreview) {
             if (cf == GUID_ContainerFormatJpeg) r->format = "jpeg";
             else if (cf == GUID_ContainerFormatPng) r->format = "png";
             else if (cf == GUID_ContainerFormatGif) r->format = "gif";
@@ -438,6 +585,19 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
             else if (cf == GUID_ContainerFormatTiff) r->format = "tiff";
             else if (cf == GUID_ContainerFormatIco) { r->format = "ico"; isIco = true; }
         }
+        bool gifOk = false;
+        if (cf == GUID_ContainerFormatGif && !g_gifOff.load()) {
+            UINT gw = 0, gh = 0;
+            if (decodeGifFrames(dec.Get(), *r, gw, gh)) {   // 动画:第一帧当静态图用,其余帧留在 r->frames 里
+                ComPtr<IWICBitmap> f0 = r->frames[0];
+                f0.As(&src);
+                w = gw;
+                h = gh;
+                r->bits = 8;
+                gifOk = true;
+            }
+        }
+        if (!gifOk) {
         UINT fidx = 0;
         if (isIco) {   // 图标里常有 16~256 多个尺寸:取最大的那张
             UINT fc = 0;
@@ -465,8 +625,9 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
             }
         }
         int fo = 1;
-        if (queryOrientation(frame.Get(), fo) && !(isRaw && orient != 1)) orient = fo;   // RAW 以容器里的方向为准
+        if (queryOrientation(frame.Get(), fo) && !(rawPreview && orient != 1)) orient = fo;   // 内嵌预览的 RAW 以容器里的方向为准
         frame.As(&src);
+        }   // !gifOk
     }
 
     // 先缩到不超过 16384(再大的图显卡贴不上),再转成预乘 BGRA
@@ -502,6 +663,13 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
     if (FAILED(g_wic->CreateBitmapFromSource(cur.Get(), WICBitmapCacheOnLoad, &bmp))) return r;
     UINT tw = 0, th = 0;
     bmp->GetSize(&tw, &th);
+    {
+        const double gm = g_gamma.load();
+        if (gm > 0.0) {   // Display/GammaEnabled
+            if (auto nb = applyGamma(bmp.Get(), gm)) bmp = nb;
+            for (auto& fr : r->frames) if (auto nf = applyGamma(fr.Get(), gm)) fr = nf;
+        }
+    }
     r->bmp = bmp;
     r->texW = tw;
     r->texH = th;
@@ -510,7 +678,8 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
     UINT ow = swap ? h : w, oh = swap ? w : h;
     r->origW = ow;
     r->origH = oh;
-    r->bytes = (size_t)tw * th * 4;
+    r->bytes = (size_t)tw * th * 4 * (1 + (r->frames.size() > 1 ? r->frames.size() : 0));
+    if (r->frames.size() < 2) { r->frames.clear(); r->delays.clear(); }
     r->ok = true;
     r->err.clear();
     r->secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -521,6 +690,7 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
 class Cache {
 public:
     explicit Cache(size_t limitBytes) : limit_(limitBytes) {}
+    void setMaxEntries(size_t n) { std::lock_guard<std::mutex> g(m_); maxEntries_ = std::max<size_t>(2, n); }
     std::shared_ptr<Loaded> get(const std::wstring& path) {
         std::lock_guard<std::mutex> g(m_);
         auto it = map_.find(lowerW(path));
@@ -536,7 +706,7 @@ public:
         map_[k] = v;
         bytes_ += v->bytes;
         lru_.push_front(k);
-        while (bytes_ > limit_ && lru_.size() > 2) {   // 至少留 2 张(当前 + 下一张)
+        while ((bytes_ > limit_ || map_.size() > maxEntries_) && lru_.size() > 2) {   // 至少留 2 张(当前 + 下一张)
             std::wstring old = lru_.back();
             lru_.pop_back();
             auto o = map_.find(old);
@@ -578,6 +748,7 @@ private:
     std::list<std::wstring> lru_;
     std::set<std::wstring> inflight_;
     size_t bytes_ = 0, limit_;
+    size_t maxEntries_ = 64;
 };
 
 // ------------------------------------------------------------------ 解码线程池(预读 + 当前图)
@@ -619,6 +790,7 @@ private:
 struct Theme {
     unsigned toolbarBg = 0xE8EEF4, statusBg = 0xDCE6EE, statusFg = 0x303030, icon = 0x3D3D3D;
     unsigned canvas = 0x202020, canvasErr = 0xFFA0A0, hover = 0xC8D8E8, border = 0xA0B0C0, accentSoft = 0x9CB8D8;
+    unsigned bg = 0xE0E0E0;   // 主题背景色:Display/DarkTitleBar=Auto 时按它的明暗决定标题栏深浅
     std::wstring font = L"Microsoft YaHei UI";
     float fontPt = 9.0f;
     int toolbarH = 26, statusH = 18;
@@ -633,11 +805,17 @@ int pxOf(const std::string& s, int def) {
 // 命令:原生版实现了的查看窗口命令(顺序 = 快捷键冲突时的优先级)
 const char* const kCmds[] = {
     "BackToBrowser", "CloseImage", "Exit", "QuitBrowser",
-    "NextImage", "PrevImage", "FirstImage", "LastImage",
+    "NextImage", "PrevImage", "FirstImage", "LastImage", "PrevFolder", "NextFolder",
     "ZoomIn", "ZoomOut", "FitWindow", "ActualSize", "ZoomLock",
-    "RotateLeft", "RotateRight", "Fullscreen", "AlwaysOnTop",
-    "ReloadImage", "OpenFile", "CopyImage", "CopyPath", "ShowInExplorer", "Properties", "Delete",
-    "ToggleToolbar", "ToggleStatusBar",
+    "RotateLeft", "RotateRight", "RotateBy", "Fullscreen", "AlwaysOnTop",
+    "ReloadImage", "OpenFile", "SaveAs", "CopyImage", "CopyPath", "ShowInExplorer", "Properties", "Delete",
+    "CopyTo", "MoveTo", "Rename", "Undo", "SetWallpaper", "Print",
+    "ToggleToolbar", "ToggleStatusBar", "ToggleMenu", "ToggleKeyHints", "ToggleFilmstrip", "ToggleSlideshow",
+    "About",
+    // 下面这些要用 Xdir(评分/色标/收藏存在 SQLite 里,选项窗口是 Qt 写的):原生版把命令交给 Xdir 去办
+    "Options", "ManageExtensions", "FileAssoc", "FileUnassoc", "CommandPalette",
+    "Rate0", "Rate1", "Rate2", "Rate3", "Rate4", "Rate5", "LabelRed", "LabelYellow", "LabelGreen", "LabelBlue",
+    "ToggleFavorite", "ShowFavorites",
     "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"};
 
 bool implemented(const std::string& c) {
@@ -648,6 +826,8 @@ bool implemented(const std::string& c) {
 struct Icon {
     SvgIcon svg;
     std::vector<ComPtr<ID2D1PathGeometry>> geos;
+    ComPtr<ID2D1Bitmap> bmp;   // 用户自己的 png/ico/jpg 图标:彩色原样缩放,不上色
+    bool raster = false;
     bool ok = false;
 };
 
@@ -658,6 +838,202 @@ struct Button {
 };
 
 // ------------------------------------------------------------------ 应用
+// ---------------- 简单输入框(模态)
+struct PromptState { std::wstring title, label, text; int selLen = -1; bool ok = false, done = false; HWND edit = nullptr; HFONT font = nullptr; };
+LRESULT CALLBACK PromptProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    PromptState* ps = (PromptState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_CREATE: {
+        ps = (PromptState*)((CREATESTRUCTW*)lp)->lpCreateParams;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)ps);
+        NONCLIENTMETRICSW ncm;
+        ZeroMemory(&ncm, sizeof ncm);
+        ncm.cbSize = sizeof ncm;
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+        ps->font = CreateFontIndirectW(&ncm.lfMessageFont);
+        HINSTANCE hi = GetModuleHandleW(nullptr);
+        HWND lab = CreateWindowExW(0, L"STATIC", ps->label.c_str(), WS_CHILD | WS_VISIBLE, 12, 12, 396, 20, h, nullptr, hi, nullptr);
+        ps->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ps->text.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 12, 36, 396, 24, h, (HMENU)(INT_PTR)100, hi, nullptr);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 238, 74, 80, 26, h, (HMENU)(INT_PTR)IDOK, hi, nullptr);
+        HWND cn = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 328, 74, 80, 26, h, (HMENU)(INT_PTR)IDCANCEL, hi, nullptr);
+        for (HWND c : {lab, ps->edit, ok, cn}) SendMessageW(c, WM_SETFONT, (WPARAM)ps->font, TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK && ps) {
+            wchar_t buf[1024];
+            GetWindowTextW(ps->edit, buf, 1024);
+            ps->text = buf;
+            ps->ok = true;
+            DestroyWindow(h);
+            return 0;
+        }
+        if (LOWORD(wp) == IDCANCEL) { DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY:
+        if (ps) { ps->done = true; if (ps->font) { DeleteObject(ps->font); ps->font = nullptr; } }
+        return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+bool promptText(HWND owner, const std::wstring& title, const std::wstring& label, std::wstring& text, int selLen = -1) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc;
+        ZeroMemory(&wc, sizeof wc);
+        wc.lpfnWndProc = PromptProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"XviewPrompt";
+        RegisterClassW(&wc);
+        reg = true;
+    }
+    PromptState ps;
+    ps.title = title; ps.label = label; ps.text = text; ps.selLen = selLen;
+    RECT rc = {0, 0, 420, 112};
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRectEx(&rc, style, FALSE, WS_EX_DLGMODALFRAME);
+    RECT orc = {0, 0, 0, 0};
+    if (owner) GetWindowRect(owner, &orc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    int x = owner ? orc.left + ((orc.right - orc.left) - w) / 2 : CW_USEDEFAULT;
+    int y = owner ? orc.top + ((orc.bottom - orc.top) - h) / 2 : CW_USEDEFAULT;
+    HWND d = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"XviewPrompt", title.c_str(), style, x, y, w, h, owner, nullptr, GetModuleHandleW(nullptr), &ps);
+    if (!d) return false;
+    if (owner) EnableWindow(owner, FALSE);
+    ShowWindow(d, SW_SHOW);
+    SetForegroundWindow(d);
+    SetFocus(ps.edit);
+    int len = (int)ps.text.size();
+    SendMessageW(ps.edit, EM_SETSEL, 0, selLen >= 0 ? selLen : len);
+    MSG msg;
+    while (!ps.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(d, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    if (owner) { EnableWindow(owner, TRUE); SetForegroundWindow(owner); }
+    if (ps.ok) text = ps.text;
+    return ps.ok;
+}
+
+// 把一幅 WIC 图写成文件(扩展名决定格式)
+// 把位图按当前旋转角度转出来(90 度倍数精确转,其它角度双线性插值,空白处透明)。角度为 0 时原样返回。
+ComPtr<IWICBitmapSource> rotatedForSave(IWICBitmap* bmp, UINT w, UINT h, double deg, UINT& ow, UINT& oh) {
+    ow = w; oh = h;
+    ComPtr<IWICBitmapSource> same(bmp);
+    double d = std::fmod(std::fmod(deg, 360.0) + 360.0, 360.0);
+    if (!bmp || !g_wic || d < 1e-6 || d > 360.0 - 1e-6) return same;
+    std::vector<BYTE> px((size_t)w * h * 4);
+    WICRect rc = {0, 0, (INT)w, (INT)h};
+    if (FAILED(bmp->CopyPixels(&rc, w * 4, (UINT)px.size(), px.data()))) return same;
+    const double a = d * 3.14159265358979323846 / 180.0, c = std::cos(a), sn = std::sin(a);
+    double bw = std::fabs(w * c) + std::fabs(h * sn), bh = std::fabs(w * sn) + std::fabs(h * c);
+    if (std::fabs(d - 90.0) < 1e-6 || std::fabs(d - 270.0) < 1e-6) { bw = h; bh = w; }
+    else if (std::fabs(d - 180.0) < 1e-6) { bw = w; bh = h; }
+    UINT W = (UINT)std::max(1.0, std::floor(bw + 0.5)), H = (UINT)std::max(1.0, std::floor(bh + 0.5));
+    if ((size_t)W * H > (size_t)20000 * 20000) return same;
+    std::vector<BYTE> out((size_t)W * H * 4, 0);
+    const double cx = w / 2.0, cy = h / 2.0, ox = W / 2.0, oy = H / 2.0;
+    for (UINT y = 0; y < H; ++y) {
+        for (UINT x = 0; x < W; ++x) {
+            double dx = x + 0.5 - ox, dy = y + 0.5 - oy;
+            double sx = dx * c + dy * sn + cx - 0.5, sy = -dx * sn + dy * c + cy - 0.5;   // 逆向映射回原图
+            BYTE* o = &out[((size_t)y * W + x) * 4];
+            if (sx < -0.5 || sy < -0.5 || sx > w - 0.5 || sy > h - 0.5) continue;
+            int x0 = (int)std::floor(sx), y0 = (int)std::floor(sy);
+            double fx = sx - x0, fy = sy - y0;
+            for (int k = 0; k < 4; ++k) {
+                double v = 0;
+                for (int j = 0; j < 2; ++j)
+                    for (int i = 0; i < 2; ++i) {
+                        int xx = std::min<int>((int)w - 1, std::max(0, x0 + i)), yy = std::min<int>((int)h - 1, std::max(0, y0 + j));
+                        v += px[((size_t)yy * w + xx) * 4 + k] * (i ? fx : 1 - fx) * (j ? fy : 1 - fy);
+                    }
+                o[k] = (BYTE)std::min(255.0, v + 0.5);
+            }
+        }
+    }
+    ComPtr<IWICBitmap> nb;
+    if (FAILED(g_wic->CreateBitmapFromMemory(W, H, GUID_WICPixelFormat32bppPBGRA, W * 4, (UINT)out.size(), out.data(), &nb))) return same;
+    ow = W; oh = H;
+    ComPtr<IWICBitmapSource> r;
+    nb.As(&r);
+    return r;
+}
+
+bool saveBitmapFile(IWICBitmapSource* src, UINT w, UINT h, const std::wstring& path) {
+    if (!src || !g_wic) return false;
+    std::wstring e = extOf(path);
+    GUID fmt = GUID_ContainerFormatPng;
+    bool opaque = false;
+    if (e == L"jpg" || e == L"jpeg") { fmt = GUID_ContainerFormatJpeg; opaque = true; }
+    else if (e == L"bmp") { fmt = GUID_ContainerFormatBmp; opaque = true; }
+    else if (e == L"tif" || e == L"tiff") fmt = GUID_ContainerFormatTiff;
+    else if (e == L"gif") fmt = GUID_ContainerFormatGif;
+    ComPtr<IWICStream> st;
+    if (FAILED(g_wic->CreateStream(&st))) return false;
+    if (FAILED(st->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) return false;
+    ComPtr<IWICBitmapEncoder> enc;
+    if (FAILED(g_wic->CreateEncoder(fmt, nullptr, &enc))) return false;
+    if (FAILED(enc->Initialize(st.Get(), WICBitmapEncoderNoCache))) return false;
+    ComPtr<IWICBitmapFrameEncode> fr;
+    ComPtr<IPropertyBag2> pb;
+    if (FAILED(enc->CreateNewFrame(&fr, &pb))) return false;
+    if (e == L"jpg" || e == L"jpeg") {
+        PROPBAG2 opt;
+        ZeroMemory(&opt, sizeof opt);
+        opt.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT v;
+        VariantInit(&v);
+        v.vt = VT_R4;
+        v.fltVal = 0.92f;
+        pb->Write(1, &opt, &v);
+    }
+    if (FAILED(fr->Initialize(pb.Get()))) return false;
+    if (FAILED(fr->SetSize(w, h))) return false;
+    WICPixelFormatGUID pf = opaque ? GUID_WICPixelFormat24bppBGR : GUID_WICPixelFormat32bppBGRA;
+    if (FAILED(fr->SetPixelFormat(&pf))) return false;
+    ComPtr<IWICFormatConverter> cv;
+    if (FAILED(g_wic->CreateFormatConverter(&cv))) return false;
+    if (FAILED(cv->Initialize(src, pf, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) return false;
+    if (FAILED(fr->WriteSource(cv.Get(), nullptr))) return false;
+    if (FAILED(fr->Commit())) return false;
+    return SUCCEEDED(enc->Commit());
+}
+
+
+bool sameFileContent(const std::wstring& a, const std::wstring& b) {
+    WIN32_FILE_ATTRIBUTE_DATA da, db;
+    if (!GetFileAttributesExW(a.c_str(), GetFileExInfoStandard, &da) || !GetFileAttributesExW(b.c_str(), GetFileExInfoStandard, &db)) return false;
+    if (da.nFileSizeHigh != db.nFileSizeHigh || da.nFileSizeLow != db.nFileSizeLow) return false;
+    FILE* fa = _wfopen(a.c_str(), L"rb");
+    FILE* fb = _wfopen(b.c_str(), L"rb");
+    bool same = fa && fb;
+    if (same) {
+        std::vector<char> x(1 << 16), y(1 << 16);
+        for (;;) {
+            size_t n = fread(x.data(), 1, x.size(), fa), m = fread(y.data(), 1, y.size(), fb);
+            if (n != m || memcmp(x.data(), y.data(), n) != 0) { same = false; break; }
+            if (n == 0) break;
+        }
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+std::wstring uniqueName(const std::wstring& dir, const std::wstring& name, const std::wstring& sep) {
+    size_t dot = name.find_last_of(L'.');
+    std::wstring stem = (dot == std::wstring::npos || dot == 0) ? name : name.substr(0, dot);
+    std::wstring ext = (dot == std::wstring::npos || dot == 0) ? L"" : name.substr(dot);
+    for (int n = 1; n < 10000; ++n) {
+        std::wstring c = dir + L"\\" + stem + sep + std::to_wstring(n) + ext;
+        if (GetFileAttributesW(c.c_str()) == INVALID_FILE_ATTRIBUTES) return c;
+    }
+    return dir + L"\\" + name;
+}
+
+
 struct App {
     HWND hwnd = nullptr;
     std::wstring root;
@@ -669,6 +1045,7 @@ struct App {
     std::set<std::wstring> exts;
     Cache cache{512ull << 20};
     Pool pool;
+    Pool thumbPool;
     int dpi = 96;
 
     ComPtr<ID2D1Factory> d2d;
@@ -686,7 +1063,7 @@ struct App {
     std::string runtimeErr;
 
     double zoom = 1.0, offX = 0, offY = 0;
-    int rot = 0;
+    double rotDeg = 0;   // 顺时针旋转角度(右/左转 = ±90,"旋转..."可以输入任意角度)
     bool fitAuto = true, zoomLock = false;
     bool fullscreen = false, topmost = false, showToolbar = true, showStatus = true;
     bool anchorValid = false;
@@ -703,6 +1080,26 @@ struct App {
     int hotBtn = -1, downBtn = -1;
     bool trackingLeave = false;
 
+    // ---- 新增状态
+    HMENU menubar = nullptr;
+    std::vector<std::string> menuCmd;                       // 菜单栏里 ID_MENU_BASE+i 对应的命令
+    bool showMenu = false, keyHints = false, showFilm = false, slideshow = false;
+    std::string hintText;                                   // 状态栏左侧的按键提示
+    std::map<std::string, std::pair<std::string, std::string>> custom;   // buttons.json:命令 → (图标文件, 提示)
+    HWND tip = nullptr;                                     // 按钮提示气泡
+    std::string tipSig;
+    std::deque<std::wstring> tipTexts;
+    int tipCount = 0;
+    size_t animIdx = 0;                                     // GIF 当前帧
+    std::vector<ComPtr<ID2D1Bitmap>> animBmps;
+    struct UndoOp { int kind; std::wstring a, b; };         // kind 1:b 改名/移动成了 a 之前的样子(撤销 = 把 b 搬回 a);kind 2:a 被删进回收站
+    std::vector<UndoOp> undoStack;
+    std::map<std::wstring, ComPtr<ID2D1Bitmap>> thumbs;     // 胶片条缩略图
+    std::set<std::wstring> thumbFail;
+    bool thumbMore = false;
+    int darkApplied = -1;
+    unsigned long long cfgStamp = 0;                        // data\config\settings.ini 的修改时间:变了就重读(在 Xdir 里改了选项)
+
     // ---------------- 小工具
     int S(int v) const { return MulDiv(v, dpi, 96); }
     std::string tr(const std::string& key, const std::string& def = "") const { return unescape(loc.get("/" + key, def)); }
@@ -713,16 +1110,42 @@ struct App {
     RECT canvasRect() const {
         RECT r = client();
         r.top = tbH();
-        r.bottom = std::max(r.top, r.bottom - stH());
+        r.bottom = std::max(r.top, r.bottom - stH() - filmH());
+        return r;
+    }
+    int filmH() const {
+        if (!showFilm || fullscreen || files.empty()) return 0;
+        return S(std::max(40, std::min(200, cfg.getInt("Viewer/FilmstripHeight", 84))));
+    }
+    RECT filmRect() const {
+        RECT r = client();
+        r.bottom = std::max<LONG>(0, r.bottom - stH());
+        r.top = std::max<LONG>(0, r.bottom - filmH());
         return r;
     }
     bool hasImage() const { return cur && cur->ok && bitmap; }
-    double effW() const { return (rot & 1) ? cur->origH : cur->origW; }
-    double effH() const { return (rot & 1) ? cur->origW : cur->origH; }
+    // 旋转后能装下整幅图的外框尺寸(90 度的整数倍时就是宽高互换)
+    void rotBounds(double& bw, double& bh) const {
+        double w = cur->origW, h = cur->origH;
+        double r = std::fmod(std::fmod(rotDeg, 180.0) + 180.0, 180.0);
+        if (r == 0.0) { bw = w; bh = h; return; }
+        if (r == 90.0) { bw = h; bh = w; return; }
+        double a = rotDeg * 3.14159265358979323846 / 180.0, c = std::fabs(std::cos(a)), sn = std::fabs(std::sin(a));
+        bw = w * c + h * sn;
+        bh = w * sn + h * c;
+    }
+    double effW() const { double a, b; rotBounds(a, b); return a; }
+    double effH() const { double a, b; rotBounds(a, b); return b; }
     void invalidate() { if (hwnd) InvalidateRect(hwnd, nullptr, FALSE); }
 
     // ---------------- 配置加载
     void loadConfig() {
+        th = Theme();
+        exts.clear();
+        iconOf.clear();
+        keys = Keymap();
+        icons.clear();
+        custom.clear();
         Ini tpl;
         tpl.loadText(readFileText(root + L"\\app\\config\\settings.ini"));
         cfg = tpl;
@@ -741,6 +1164,16 @@ struct App {
         if (parseJson(readFileText(root + L"\\app\\config\\commands.json"), cj) && cj.t == Json::Arr)
             for (auto& c : cj.a) iconOf[c.str("id")] = c.str("icon");
 
+        iconOf["@Menu"] = iconOf["ToggleMenu"];
+        // 用户给按钮换的图标 / 写的提示(data\config\buttons.json:{命令ID:{icon,tip}})
+        Json bj;
+        if (parseJson(readFileText(root + L"\\data\\config\\buttons.json"), bj) && bj.t == Json::Obj)
+            for (auto& p : bj.o) {
+                if (p.second.t != Json::Obj) continue;
+                std::string ic = p.second.str("icon"), tp = p.second.str("tip");
+                custom[p.first] = {ic, tp};
+                if (!ic.empty()) iconOf[p.first] = ic;
+            }
         // 主题
         std::string tname = trim(readFileText(root + L"\\data\\config\\theme.txt"));
         if (tname.compare(0, 3, "\xEF\xBB\xBF") == 0) tname.erase(0, 3);
@@ -750,7 +1183,7 @@ struct App {
                 auto col = [&](const char* k, unsigned& dst) { dst = parseHexColor(tj.str(k), dst); };
                 col("toolbar_bg", th.toolbarBg); col("status_bg", th.statusBg); col("status_fg", th.statusFg);
                 col("icon", th.icon); col("canvas", th.canvas); col("canvas_error", th.canvasErr);
-                col("hover", th.hover); col("border", th.border); col("accent_soft", th.accentSoft);
+                col("hover", th.hover); col("border", th.border); col("accent_soft", th.accentSoft); col("bg", th.bg);
                 if (!tj.find("canvas")) th.canvas = parseHexColor(tj.str("bg"), th.canvas);
                 if (!tj.find("canvas_error")) th.canvasErr = parseHexColor(tj.str("danger"), th.canvasErr);
                 th.toolbarH = pxOf(tj.str("toolbar_h"), th.toolbarH);
@@ -772,6 +1205,26 @@ struct App {
         showStatus = cfg.getBool("Viewer/ShowStatusBar", true);
         zoomLock = cfg.getBool("Viewer/ZoomLock", false);
         topmost = cfg.getBool("Viewer/AlwaysOnTop", false);
+        showMenu = cfg.getBool("Viewer/ShowMenu", false);
+        keyHints = cfg.getBool("Viewer/ShowKeyHints", false);
+        showFilm = cfg.getBool("Viewer/ShowFilmstrip", false);
+        { std::string rm = cfg.get("Viewer/RawMode", "Auto"); g_rawMode = rm == "Preview" ? 1 : rm == "Develop" ? 2 : 0; }
+        g_gamma = cfg.getBool("Display/GammaEnabled", false) ? std::max(0.1, cfg.getDouble("Display/Gamma", 1.0)) : 0.0;
+        g_gifOff = cfg.getBool("Display/DisableGifAnimation", false);
+        cache.setMaxEntries((size_t)std::max(cfg.getInt("Viewer/CacheCount", 5), 2 * std::min(5, std::max(0, cfg.getInt("Viewer/PreloadCount", 1))) + 1));
+        hintText.clear();   // 状态栏左侧的按键提示:常用命令的第一个快捷键
+        for (auto c : {"NextImage", "PrevImage", "ZoomIn", "ZoomOut", "FitWindow", "ActualSize", "RotateLeft", "RotateRight", "Fullscreen", "BackToBrowser"}) {
+            auto k = cfg.getList(std::string("Keys/") + c);
+            if (k.empty()) continue;
+            if (!hintText.empty()) hintText += "    ";
+            hintText += k[0] + " " + cmdLabel(c);
+        }
+        cfgStamp = settingsStamp();
+    }
+    unsigned long long settingsStamp() const {   // 用户设置文件的修改时间(0 = 没有这个文件)
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (!GetFileAttributesExW((root + L"\\data\\config\\settings.ini").c_str(), GetFileExInfoStandard, &fad)) return 0;
+        return ((unsigned long long)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
     }
 
     // ---------------- Direct2D / DirectWrite
@@ -803,6 +1256,9 @@ struct App {
     }
     void dropTarget() {
         runtimeErr.clear();
+        animBmps.clear();
+        thumbs.clear();
+        for (auto it = icons.begin(); it != icons.end();) { if (it->second.raster) it = icons.erase(it); else ++it; }
         bitmap.Reset();
         brush.Reset();
         rt.Reset();
@@ -828,8 +1284,23 @@ struct App {
         auto it = icons.find(file);
         if (it != icons.end()) return it->second.ok ? &it->second : nullptr;
         Icon& ic = icons[file];
-        std::string txt = readFileText(root + L"\\data\\config\\icons\\" + W(file));
-        if (txt.empty()) txt = readFileText(root + L"\\app\\resources\\icons\\" + W(file));
+        std::wstring p1 = root + L"\\data\\config\\icons\\" + W(file), p2 = root + L"\\app\\resources\\icons\\" + W(file);
+        if (extOf(W(file)) != L"svg") {   // png / ico / jpg:用户自己的彩色图标
+            ic.raster = true;
+            std::wstring pp = fileExists(p1) ? p1 : p2;
+            ComPtr<IWICBitmapDecoder> dc;
+            ComPtr<IWICBitmapFrameDecode> fr;
+            ComPtr<IWICFormatConverter> cv;
+            if (rt && SUCCEEDED(g_wic->CreateDecoderFromFilename(pp.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dc)) &&
+                SUCCEEDED(dc->GetFrame(0, &fr)) && SUCCEEDED(g_wic->CreateFormatConverter(&cv)) &&
+                SUCCEEDED(cv->Initialize(fr.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeMedianCut)))
+                rt->CreateBitmapFromWicBitmap(cv.Get(), nullptr, &ic.bmp);
+            ic.ok = ic.bmp != nullptr;
+            if (!ic.ok) icons.erase(file);
+            return ic.ok ? &icons[file] : nullptr;
+        }
+        std::string txt = readFileText(p1);
+        if (txt.empty()) txt = readFileText(p2);
         if (!txt.empty() && parseSvg(txt, ic.svg)) {
             for (auto& p : ic.svg.paths) {
                 ComPtr<ID2D1PathGeometry> g = buildGeometry(p);
@@ -890,6 +1361,10 @@ struct App {
         if (c == "ZoomLock") return zoomLock;
         if (c == "ToggleToolbar") return showToolbar;
         if (c == "ToggleStatusBar") return showStatus;
+        if (c == "ToggleMenu") return showMenu;
+        if (c == "ToggleKeyHints") return keyHints;
+        if (c == "ToggleFilmstrip") return showFilm;
+        if (c == "ToggleSlideshow") return slideshow;
         return false;
     }
     void layoutToolbar() {
@@ -907,7 +1382,8 @@ struct App {
                 x += S(8);
                 lastSep = true;
             } else {
-                if (tok[0] == '@' || !implemented(tok)) continue;
+                if (tok == "@Menu") { if (showMenu) continue; }   // 菜单栏已经显示时,这个按钮就多余了
+                else if (tok[0] == '@' || !implemented(tok)) continue;
                 b.cmd = tok;
                 b.r = {x, S(1), x + bw, h - S(1)};
                 x += bw + S(1);
@@ -925,10 +1401,120 @@ struct App {
         return -1;
     }
     std::string hintFor(const std::string& cmd) const {
-        std::string s = cmdLabel(cmd);
+        if (cmd == "@Menu") return cmdLabel("ToggleMenu");
+        auto cu = custom.find(cmd);
+        std::string s = (cu != custom.end() && !cu->second.second.empty()) ? cu->second.second : cmdLabel(cmd);   // 用户自己写的提示优先
         auto k = cfg.getList("Keys/" + cmd);
         if (!k.empty()) s += "  (" + k[0] + ")";
         return s;
+    }
+
+    // ---------------- 菜单栏 / 弹出菜单(设置里的 [MenuViewer])
+    void appendCmd(HMENU m, const std::string& tok, std::vector<std::string>& list, UINT base) {
+        std::wstring label = W(cmdLabel(tok));
+        auto k = cfg.getList("Keys/" + tok);
+        if (!k.empty()) label += L"\t" + W(k[0]);
+        UINT id = base + (UINT)list.size();
+        list.push_back(tok);
+        AppendMenuW(m, MF_STRING | (checked(tok) ? MF_CHECKED : 0), id, label.c_str());
+    }
+    HMENU makeMenuTree(bool popup, std::vector<std::string>& list, UINT base) {
+        HMENU root_ = popup ? CreatePopupMenu() : CreateMenu();
+        for (auto& name : cfg.getList("MenuViewer/Order")) {
+            HMENU sub = CreatePopupMenu();
+            int n = 0;
+            bool lastSep = true;
+            for (auto& tok : cfg.getList("MenuViewer/" + name)) {
+                if (tok == "|") { if (!lastSep) { AppendMenuW(sub, MF_SEPARATOR, 0, nullptr); lastSep = true; } continue; }
+                if (!implemented(tok) || tok.compare(0, 5, "Arrow") == 0) continue;
+                appendCmd(sub, tok, list, base);
+                lastSep = false;
+                ++n;
+            }
+            if (n && lastSep) RemoveMenu(sub, (UINT)GetMenuItemCount(sub) - 1, MF_BYPOSITION);
+            if (n) AppendMenuW(root_, MF_POPUP, (UINT_PTR)sub, W(tr("menu." + name, name)).c_str());
+            else DestroyMenu(sub);
+        }
+        return root_;
+    }
+    void buildMenus() {
+        if (menubar) {
+            if (hwnd && GetMenu(hwnd) == menubar) SetMenu(hwnd, nullptr);
+            DestroyMenu(menubar);
+            menubar = nullptr;
+        }
+        menuCmd.clear();
+        menubar = makeMenuTree(false, menuCmd, ID_MENU_BASE);
+    }
+    void applyMenu() {   // ShowMenu / ToggleMenu;全屏时一律不显示
+        if (!hwnd) return;
+        bool want = showMenu && !fullscreen;
+        if (want) {
+            if (!menubar) buildMenus();
+            if (GetMenu(hwnd) != menubar) SetMenu(hwnd, menubar);
+        } else if (GetMenu(hwnd)) {
+            SetMenu(hwnd, nullptr);
+        }
+        DrawMenuBar(hwnd);
+    }
+    void refreshMenuChecks(HMENU h) {
+        for (int i = 0, n = GetMenuItemCount(h); i < n; ++i) {
+            UINT id = GetMenuItemID(h, i);
+            if (id >= ID_MENU_BASE && id < ID_MENU_BASE + menuCmd.size())
+                CheckMenuItem(h, (UINT)i, MF_BYPOSITION | (checked(menuCmd[id - ID_MENU_BASE]) ? MF_CHECKED : MF_UNCHECKED));
+        }
+    }
+    void popupAllMenus(int sx, int sy) {   // 工具栏上的 @Menu 按钮:把所有菜单合在一起弹出
+        std::vector<std::string> list;
+        HMENU m = makeMenuTree(true, list, ID_MENU_BASE + 1000);
+        SetForegroundWindow(hwnd);
+        int sel = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, sx, sy, 0, hwnd, nullptr);
+        DestroyMenu(m);
+        if (sel >= (int)(ID_MENU_BASE + 1000) && sel - (int)(ID_MENU_BASE + 1000) < (int)list.size()) run(list[(size_t)(sel - (int)(ID_MENU_BASE + 1000))]);
+    }
+
+    // ---------------- 按钮提示气泡(Misc/ShowToolTips)
+    void syncTips() {
+        if (!hwnd) return;
+        if (!cfg.getBool("Misc/ShowToolTips", true)) {
+            if (tip) { DestroyWindow(tip); tip = nullptr; tipSig.clear(); tipCount = 0; tipTexts.clear(); }
+            return;
+        }
+        if (!tip) {
+            INITCOMMONCONTROLSEX ic = {sizeof ic, ICC_BAR_CLASSES};
+            InitCommonControlsEx(&ic);
+            tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                  CW_USEDEFAULT, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (!tip) return;
+            tipSig.clear();
+        }
+        std::string sig;
+        for (auto& b : buttons) if (!b.sep) sig += b.cmd + ":" + std::to_string(b.r.left) + "," + std::to_string(b.r.top) + "," + std::to_string(b.r.right) + "," + std::to_string(b.r.bottom) + ";";
+        if (sig == tipSig) return;
+        tipSig = sig;
+        for (int i = 1; i <= tipCount; ++i) {
+            TOOLINFOW ti;
+            ZeroMemory(&ti, sizeof ti);
+            ti.cbSize = sizeof ti;
+            ti.hwnd = hwnd;
+            ti.uId = (UINT_PTR)i;
+            SendMessageW(tip, TTM_DELTOOLW, 0, (LPARAM)&ti);
+        }
+        tipCount = 0;
+        tipTexts.clear();
+        for (auto& b : buttons) {
+            if (b.sep) continue;
+            tipTexts.push_back(W(hintFor(b.cmd)));
+            TOOLINFOW ti;
+            ZeroMemory(&ti, sizeof ti);
+            ti.cbSize = sizeof ti;
+            ti.uFlags = TTF_SUBCLASS;
+            ti.hwnd = hwnd;
+            ti.uId = (UINT_PTR)(++tipCount);
+            ti.rect = b.r;
+            ti.lpszText = const_cast<LPWSTR>(tipTexts.back().c_str());
+            SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        }
     }
 
     // ---------------- 绘制
@@ -945,9 +1531,13 @@ struct App {
         rt->DrawText(w.c_str(), (UINT32)w.size(), tf.Get(), D2D1::RectF((float)r.left, (float)r.top, (float)r.right, (float)r.bottom), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
     void drawIcon(Icon& ic, float x, float y, float size) {
+        if (ic.raster) {
+            if (ic.bmp) rt->DrawBitmap(ic.bmp.Get(), D2D1::RectF(x, y, x + size, y + size), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            return;
+        }
         float s = size / (float)ic.svg.vbW;
         rt->SetTransform(D2D1::Matrix3x2F::Translation((float)-ic.svg.vbX, (float)-ic.svg.vbY) * D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(x, y));
-        setBrush(th.icon);
+        setBrush((!cfg.getBool("Icons/Tint", true) && ic.svg.hasStroke) ? ic.svg.stroke : th.icon);   // Tint=0:图标文件自带的颜色
         for (auto& g : ic.geos) rt->DrawGeometry(g.Get(), brush.Get(), (float)ic.svg.strokeWidth, stroke.Get());
         rt->SetTransform(D2D1::Matrix3x2F::Identity());
     }
@@ -957,8 +1547,8 @@ struct App {
         float cx = c.left + vw / 2 + (float)offX, cy = c.top + vh / 2 + (float)offY;
         float dw = (float)(cur->origW * zoom), dh = (float)(cur->origH * zoom);
         rt->PushAxisAlignedClip(D2D1::RectF((float)c.left, (float)c.top, (float)c.right, (float)c.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
-        rt->SetTransform(D2D1::Matrix3x2F::Rotation((float)rot * 90.0f, D2D1::Point2F(cx, cy)));
-        rt->DrawBitmap(bitmap.Get(), D2D1::RectF(cx - dw / 2, cy - dh / 2, cx + dw / 2, cy + dh / 2), 1.0f,
+        rt->SetTransform(D2D1::Matrix3x2F::Rotation((float)rotDeg, D2D1::Point2F(cx, cy)));
+        rt->DrawBitmap(frameBitmap(), D2D1::RectF(cx - dw / 2, cy - dh / 2, cx + dw / 2, cy + dh / 2), 1.0f,
                        zoom >= 4.0 ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         rt->SetTransform(D2D1::Matrix3x2F::Identity());
         rt->PopAxisAlignedClip();
@@ -974,6 +1564,7 @@ struct App {
         std::string left;
         if (hotBtn >= 0 && hotBtn < (int)buttons.size()) left = hintFor(buttons[hotBtn].cmd);
         else if (loadingNow()) left = tr("status.loading", "...");
+        else if (keyHints) left = hintText;
         std::vector<std::string> cells;
         std::vector<int> widths;
         if (cur && cur->ok && !loadingNow()) {
@@ -1029,6 +1620,8 @@ struct App {
         if (!ensureTarget()) return;
         ensureBitmap();
         layoutToolbar();
+        syncTips();
+        applyTitleBar();
         rt->BeginDraw();
         rt->SetTransform(D2D1::Matrix3x2F::Identity());
         RECT cl = client();
@@ -1044,9 +1637,11 @@ struct App {
             else if (files.empty()) { msg = "按 Ctrl+O 打开图片,或把图片拖进窗口"; col = th.statusFg == th.canvas ? 0xFFFFFF : 0xB0B0B0; }
             if (!msg.empty()) drawText(msg, cv, col, DWRITE_TEXT_ALIGNMENT_CENTER);
         }
+        drawFilm();
         drawToolbar();
         drawStatus();
         HRESULT hr = rt->EndDraw();
+        if (thumbMore) { thumbMore = false; PostMessageW(hwnd, WM_APP_THUMB, 0, 0); }
         if (hr == D2DERR_RECREATE_TARGET) dropTarget();
     }
 
@@ -1110,7 +1705,11 @@ struct App {
     }
     void rotate(int dir) {
         if (!hasImage()) return;
-        rot = (rot + (dir > 0 ? 1 : 3)) & 3;
+        rotateBy(dir > 0 ? 90.0 : -90.0);
+    }
+    void rotateBy(double deg) {
+        if (!hasImage()) return;
+        rotDeg = std::fmod(rotDeg + deg, 360.0);
         if (fitAuto) refit(); else clampOffset();
         invalidate();
     }
@@ -1197,9 +1796,13 @@ struct App {
         cur = l;
         bitmap.Reset();
         runtimeErr.clear();
-        rot = 0;
+        rotDeg = 0;
         offX = offY = 0;
+        animIdx = 0;
+        animBmps.clear();
         if (l->ok && rt) ensureBitmap();
+        startAnim();
+        resizeToImage();
         if (l->ok && zoomLock && hadImage) { fitAuto = false; clampOffset(); }
         else refit();
         updateTitle();
@@ -1226,6 +1829,7 @@ struct App {
             std::wstring p = cfg.getBool("Viewer/ShowFullPath", true) ? files[idx] : baseName(files[idx]);
             name = fmtArgs(tr("app.titleFormat", "%1 - Xview"), U(p));
         }
+        if (cfg.getBool("Misc/TitleShowVersion", false)) name += " v1.0";
         SetWindowTextW(hwnd, W(name).c_str());
         reportState(false);
     }
@@ -1358,10 +1962,13 @@ struct App {
         op.pFrom = from.c_str();
         op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
         if (SHFileOperationW(&op) != 0 || op.fAnyOperationsAborted) return;
+        pushUndo(2, p, L"");
+        if (cfg.getBool("Viewer/ExitAfterDelete", false)) { closeWindow(); return; }
         cache.erase(p);
         files.erase(files.begin() + idx);
         cur.reset();
         bitmap.Reset();
+        animBmps.clear();
         if (files.empty()) { idx = -1; updateTitle(); invalidate(); return; }
         if (idx >= (int)files.size()) idx = (int)files.size() - 1;
         showNow();
@@ -1378,6 +1985,505 @@ struct App {
         sei.lpFile = files[idx].c_str();
         sei.nShow = SW_SHOW;
         ShellExecuteExW(&sei);
+    }
+
+    // ---------------- GIF 动画
+    ID2D1Bitmap* frameBitmap() {
+        if (cur && cur->frames.size() > 1 && !g_gifOff.load()) {
+            size_t n = cur->frames.size();
+            if (animBmps.size() != n) {
+                animBmps.assign(n, ComPtr<ID2D1Bitmap>());
+                for (size_t i = 0; i < n; ++i) rt->CreateBitmapFromWicBitmap(cur->frames[i].Get(), animBmps[i].ReleaseAndGetAddressOf());
+            }
+            ID2D1Bitmap* b = animBmps[animIdx % n].Get();
+            if (b) return b;
+        }
+        return bitmap.Get();
+    }
+    void startAnim() {
+        KillTimer(hwnd, TIMER_ANIM);
+        animIdx = 0;
+        if (cur && cur->ok && cur->frames.size() > 1 && !g_gifOff.load() && !cur->delays.empty())
+            SetTimer(hwnd, TIMER_ANIM, (UINT)std::max(20, cur->delays[0]), nullptr);
+    }
+    void stepAnim() {
+        KillTimer(hwnd, TIMER_ANIM);
+        if (!cur || cur->frames.size() < 2 || g_gifOff.load()) return;
+        animIdx = (animIdx + 1) % cur->frames.size();
+        invalidate();
+        int d = animIdx < cur->delays.size() ? cur->delays[animIdx] : 100;
+        SetTimer(hwnd, TIMER_ANIM, (UINT)std::max(20, d), nullptr);
+    }
+
+    // ---------------- 幻灯片放映
+    void toggleSlideshow() {
+        if (files.empty()) return;
+        slideshow = !slideshow;
+        if (slideshow) SetTimer(hwnd, TIMER_SHOW, (UINT)(std::max(1, cfg.getInt("Viewer/SlideshowSeconds", 3)) * 1000), nullptr);
+        else KillTimer(hwnd, TIMER_SHOW);
+        invalidate();
+    }
+    void slideStep() {
+        int cnt = (int)files.size();
+        if (!slideshow || cnt == 0) { KillTimer(hwnd, TIMER_SHOW); return; }
+        int n = idx + 1;
+        if (n >= cnt) {
+            if (!cfg.getBool("Viewer/SlideshowLoop", true)) { slideshow = false; KillTimer(hwnd, TIMER_SHOW); invalidate(); return; }
+            n = 0;
+        }
+        go(n);
+    }
+
+    // ---------------- 胶片条
+    void filmLayout(int& first, int& visible, int& cw) const {
+        RECT fr = filmRect();
+        int cell = std::max(8, filmH() - S(8)), pad = S(4);
+        cw = cell + pad;
+        int n = (int)files.size();
+        visible = std::max(1, (int)((fr.right - fr.left - pad) / cw));
+        first = idx - visible / 2;
+        first = std::max(0, std::min(first, std::max(0, n - visible)));
+    }
+    ID2D1Bitmap* thumbFor(const std::wstring& path, int size, int& made) {
+        auto it = thumbs.find(path);
+        if (it != thumbs.end()) return it->second.Get();
+        if (thumbFail.count(path)) return nullptr;
+        if (made >= 2) { thumbMore = true; return nullptr; }
+        ++made;
+        if (thumbs.size() > 400) thumbs.clear();
+        ComPtr<IShellItemImageFactory> f;
+        bool ok = false;
+        if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&f)))) {
+            SIZE sz = {size, size};
+            HBITMAP hb = nullptr;
+            if (SUCCEEDED(f->GetImage(sz, SIIGBF_BIGGERSIZEOK, &hb)) && hb) {
+                ComPtr<IWICBitmap> wb;
+                if (SUCCEEDED(g_wic->CreateBitmapFromHBITMAP(hb, nullptr, WICBitmapUseAlpha, &wb))) {
+                    ComPtr<IWICFormatConverter> cv;
+                    ComPtr<ID2D1Bitmap> db;
+                    if (SUCCEEDED(g_wic->CreateFormatConverter(&cv)) &&
+                        SUCCEEDED(cv->Initialize(wb.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) &&
+                        SUCCEEDED(rt->CreateBitmapFromWicBitmap(cv.Get(), &db)) && db) {
+                        thumbs[path] = db;
+                        ok = true;
+                    }
+                }
+                DeleteObject(hb);
+            }
+        }
+        if (!ok) { thumbFail.insert(path); return nullptr; }
+        return thumbs[path].Get();
+    }
+    void drawFilm() {
+        int h = filmH();
+        if (!h) return;
+        RECT fr = filmRect();
+        fillRect(fr, th.statusBg);
+        int first, visible, cw;
+        filmLayout(first, visible, cw);
+        int cell = cw - S(4), pad = S(4), made = 0, n = (int)files.size();
+        for (int i = 0; i < visible && first + i < n; ++i) {
+            int k = first + i;
+            int x = fr.left + pad + i * cw;
+            RECT cr = {x, fr.top + S(4), x + cell, fr.top + S(4) + cell};
+            if (k == idx) fillRect({cr.left - S(2), cr.top - S(2), cr.right + S(2), cr.bottom + S(2)}, th.accentSoft);
+            ID2D1Bitmap* tb = thumbFor(files[k], cell, made);
+            if (!tb) continue;
+            D2D1_SIZE_F bs = tb->GetSize();
+            float sc = std::min((float)cell / bs.width, (float)cell / bs.height);
+            float dw = bs.width * sc, dh = bs.height * sc;
+            float cx = (cr.left + cr.right) / 2.0f, cy = (cr.top + cr.bottom) / 2.0f;
+            rt->DrawBitmap(tb, D2D1::RectF(cx - dw / 2, cy - dh / 2, cx + dw / 2, cy + dh / 2), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+    }
+    bool filmClick(int x, int y) {
+        if (!filmH()) return false;
+        RECT fr = filmRect();
+        if (y < fr.top || y >= fr.bottom) return false;
+        int first, visible, cw;
+        filmLayout(first, visible, cw);
+        int i = (x - fr.left - S(4)) / cw;
+        if (i >= 0 && i < visible && first + i < (int)files.size()) go(first + i);
+        return true;
+    }
+
+    // ---------------- 文件操作
+    void pushUndo(int kind, const std::wstring& a, const std::wstring& b) {
+        undoStack.push_back({kind, a, b});
+        size_t mx = (size_t)std::max(1, cfg.getInt("Archive/UndoCount", 30));
+        while (undoStack.size() > mx) undoStack.erase(undoStack.begin());
+    }
+    int findFile(const std::wstring& p) const {
+        std::wstring l = lowerW(p);
+        for (size_t i = 0; i < files.size(); ++i) if (lowerW(files[i]) == l) return (int)i;
+        return -1;
+    }
+    void dropCurrentFromList() {
+        if (idx < 0 || idx >= (int)files.size()) return;
+        cache.erase(files[idx]);
+        files.erase(files.begin() + idx);
+        cur.reset();
+        bitmap.Reset();
+        animBmps.clear();
+        if (files.empty()) { idx = -1; updateTitle(); invalidate(); return; }
+        if (idx >= (int)files.size()) idx = (int)files.size() - 1;
+        showNow();
+    }
+    void insertAtCurrent(const std::wstring& p) {   // 撤销后把文件放回列表并显示
+        if (idx < 0) idx = 0;
+        int f = findFile(p);
+        if (f < 0) { idx = std::min(idx, (int)files.size()); files.insert(files.begin() + idx, p); }
+        else idx = f;
+        cache.erase(p);
+        cur.reset();
+        bitmap.Reset();
+        animBmps.clear();
+        showNow();
+    }
+    bool badName(const std::wstring& n) const {
+        return n.empty() || n.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos;
+    }
+    void renameCurrent() {
+        if (idx < 0 || idx >= (int)files.size()) return;
+        std::wstring old = files[idx], name = baseName(old), nn = name;
+        size_t dot = name.find_last_of(L'.');
+        int stem = dot == std::wstring::npos || dot == 0 ? (int)name.size() : (int)dot;
+        if (!promptText(hwnd, L"重命名", L"新文件名:", nn, stem)) return;
+        while (!nn.empty() && nn.back() == L' ') nn.pop_back();
+        if (nn == name) return;
+        if (badName(nn)) { MessageBoxW(hwnd, L"文件名不能为空,也不能包含 \\ / : * ? \" < > |", L"Xview", MB_OK | MB_ICONWARNING); return; }
+        std::wstring np = parentDir(old) + L"\\" + nn;
+        if (GetFileAttributesW(np.c_str()) != INVALID_FILE_ATTRIBUTES && lowerW(np) != lowerW(old)) {
+            MessageBoxW(hwnd, L"已经有同名文件了。", L"Xview", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (!MoveFileW(old.c_str(), np.c_str())) { MessageBoxW(hwnd, L"重命名失败(文件被占用或没有权限)。", L"Xview", MB_OK | MB_ICONERROR); return; }
+        pushUndo(1, old, np);
+        cache.erase(old);
+        files[idx] = np;
+        cur.reset();
+        bitmap.Reset();
+        animBmps.clear();
+        showNow();
+    }
+    std::wstring pickFolder(const wchar_t* title) {
+        BROWSEINFOW bi;
+        ZeroMemory(&bi, sizeof bi);
+        bi.hwndOwner = hwnd;
+        bi.lpszTitle = title;
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+        PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+        if (!pidl) return L"";
+        wchar_t buf[MAX_PATH * 2] = L"";
+        bool ok = SHGetPathFromIDListW(pidl, buf) != FALSE;
+        CoTaskMemFree(pidl);
+        return ok ? std::wstring(buf) : std::wstring();
+    }
+    void copyMoveCurrent(bool move) {
+        if (idx < 0 || idx >= (int)files.size()) return;
+        std::wstring p = files[idx];
+        std::wstring dest = pickFolder(move ? L"移动到文件夹" : L"复制到文件夹");
+        if (dest.empty()) return;
+        while (dest.size() > 3 && (dest.back() == L'\\' || dest.back() == L'/')) dest.pop_back();
+        std::wstring np = dest + (dest.back() == L'\\' ? L"" : L"\\") + baseName(p);
+        std::wstring toArg = dest;
+        FILEOP_FLAGS flags = FOF_ALLOWUNDO;
+        bool exists = GetFileAttributesW(np.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (exists) {
+            if (lowerW(np) == lowerW(p)) { if (move) return; }   // 复制到自己所在的文件夹:交给系统(它会生成\"- 副本\")
+            else {
+                if (cfg.getBool("Archive/SkipIfIdentical", true) && sameFileContent(p, np)) return;
+                std::string act = cfg.get("Archive/DuplicateAction", "Ask");
+                if (act == "Skip") return;
+                if (act == "Overwrite") flags |= FOF_NOCONFIRMATION;
+                else if (act == "AutoRename") { np = uniqueName(dest, baseName(p), W(cfg.get("Archive/RenameSeparator", "_"))); toArg = np; }
+            }
+        }
+        std::wstring from = p;
+        from.push_back(L'\0');
+        std::wstring to = toArg;
+        to.push_back(L'\0');
+        SHFILEOPSTRUCTW op;
+        ZeroMemory(&op, sizeof op);
+        op.hwnd = hwnd;
+        op.wFunc = move ? FO_MOVE : FO_COPY;
+        op.pFrom = from.c_str();
+        op.pTo = to.c_str();
+        op.fFlags = flags;
+        if (SHFileOperationW(&op) != 0 || op.fAnyOperationsAborted) return;
+        if (!move) return;
+        if (GetFileAttributesW(np.c_str()) != INVALID_FILE_ATTRIBUTES) pushUndo(1, p, np);
+        if (cfg.getBool("Viewer/ExitAfterDelete", false)) { closeWindow(); return; }
+        dropCurrentFromList();
+    }
+    bool restoreFromRecycleBin(const std::wstring& path) {
+        PIDLIST_ABSOLUTE bin = nullptr;
+        if (FAILED(SHGetSpecialFolderLocation(hwnd, CSIDL_BITBUCKET, &bin)) || !bin) return false;
+        ComPtr<IShellFolder> desk;
+        ComPtr<IShellFolder2> fold;
+        bool done = false;
+        if (SUCCEEDED(SHGetDesktopFolder(&desk)) && SUCCEEDED(desk->BindToObject(bin, nullptr, IID_PPV_ARGS(&fold)))) {
+            ComPtr<IEnumIDList> en;
+            if (SUCCEEDED(fold->EnumObjects(hwnd, SHCONTF_FOLDERS | SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN, &en)) && en) {
+                std::wstring bn = lowerW(baseName(path)), dir = lowerW(parentDir(path));
+                size_t dot = bn.find_last_of(L'.');
+                std::wstring stem = dot == std::wstring::npos ? bn : bn.substr(0, dot);
+                PITEMID_CHILD item = nullptr, pick = nullptr;
+                ULONG got = 0;
+                while (en->Next(1, &item, &got) == S_OK && got == 1) {
+                    wchar_t nm[MAX_PATH * 2] = L"", loc[MAX_PATH * 2] = L"";
+                    STRRET sr;
+                    if (SUCCEEDED(fold->GetDisplayNameOf(item, SHGDN_NORMAL, &sr))) StrRetToBufW(&sr, item, nm, MAX_PATH * 2);
+                    SHELLDETAILS sd;
+                    ZeroMemory(&sd, sizeof sd);
+                    if (SUCCEEDED(fold->GetDetailsOf(item, 1, &sd))) StrRetToBufW(&sd.str, item, loc, MAX_PATH * 2);
+                    std::wstring n = lowerW(nm), l = lowerW(loc);
+                    while (!l.empty() && (l.back() == L'\\' || l.back() == L'/')) l.pop_back();
+                    bool same = (n == bn || n == stem) && l == dir;
+                    if (same) { if (pick) CoTaskMemFree(pick); pick = item; } else CoTaskMemFree(item);
+                    item = nullptr;
+                }
+                if (pick) {
+                    ComPtr<IContextMenu> cm;
+                    PCUITEMID_CHILD arr[1] = {pick};
+                    if (SUCCEEDED(fold->GetUIObjectOf(hwnd, 1, arr, IID_IContextMenu, nullptr, (void**)&cm)) && cm) {
+                        CMINVOKECOMMANDINFO ci;
+                        ZeroMemory(&ci, sizeof ci);
+                        ci.cbSize = sizeof ci;
+                        ci.hwnd = hwnd;
+                        ci.lpVerb = "undelete";
+                        ci.nShow = SW_SHOWNORMAL;
+                        done = SUCCEEDED(cm->InvokeCommand(&ci));
+                    }
+                    CoTaskMemFree(pick);
+                }
+            }
+        }
+        CoTaskMemFree(bin);
+        return done;
+    }
+    void undoLast() {
+        if (undoStack.empty()) { MessageBoxW(hwnd, L"没有可以撤销的操作。", L"Xview", MB_OK | MB_ICONINFORMATION); return; }
+        UndoOp op = undoStack.back();
+        undoStack.pop_back();
+        if (op.kind == 1) {
+            if (GetFileAttributesW(op.b.c_str()) == INVALID_FILE_ATTRIBUTES) { MessageBoxW(hwnd, L"找不到要还原的文件了。", L"Xview", MB_OK | MB_ICONWARNING); return; }
+            if (GetFileAttributesW(op.a.c_str()) != INVALID_FILE_ATTRIBUTES && lowerW(op.a) != lowerW(op.b)) { MessageBoxW(hwnd, L"原来的位置已经有同名文件,没法还原。", L"Xview", MB_OK | MB_ICONWARNING); return; }
+            if (!MoveFileW(op.b.c_str(), op.a.c_str())) { MessageBoxW(hwnd, L"撤销失败。", L"Xview", MB_OK | MB_ICONERROR); return; }
+            int f = findFile(op.b);
+            if (f >= 0) { files[f] = op.a; idx = f; cache.erase(op.b); cache.erase(op.a); cur.reset(); bitmap.Reset(); animBmps.clear(); showNow(); }
+            else insertAtCurrent(op.a);
+        } else if (op.kind == 2) {
+            if (!restoreFromRecycleBin(op.a)) { MessageBoxW(hwnd, L"没能从回收站还原(可能已被清空),请到回收站手工还原。", L"Xview", MB_OK | MB_ICONWARNING); return; }
+            insertAtCurrent(op.a);
+        }
+    }
+    void saveAsDialog() {
+        if (!cur || !cur->ok || !cur->bmp) return;
+        wchar_t buf[MAX_PATH * 2] = L"";
+        std::wstring base = (idx >= 0 && idx < (int)files.size()) ? baseName(files[idx]) : L"image";
+        size_t dot = base.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot > 0) base = base.substr(0, dot);
+        wcsncpy(buf, base.c_str(), MAX_PATH * 2 - 1);
+        std::wstring filter;
+        auto add = [&](const wchar_t* a, const wchar_t* b) { filter += a; filter.push_back(L'\0'); filter += b; filter.push_back(L'\0'); };
+        add(L"PNG 图片 (*.png)", L"*.png");
+        add(L"JPEG 图片 (*.jpg)", L"*.jpg");
+        add(L"BMP 图片 (*.bmp)", L"*.bmp");
+        add(L"TIFF 图片 (*.tif)", L"*.tif");
+        std::wstring initDir = (idx >= 0 && idx < (int)files.size()) ? parentDir(files[idx]) : L"";
+        OPENFILENAMEW ofn;
+        ZeroMemory(&ofn, sizeof ofn);
+        ofn.lStructSize = sizeof ofn;
+        ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = filter.c_str();
+        ofn.nFilterIndex = 1;
+        ofn.lpstrFile = buf;
+        ofn.nMaxFile = MAX_PATH * 2;
+        ofn.lpstrInitialDir = initDir.empty() ? nullptr : initDir.c_str();
+        ofn.lpstrDefExt = L"png";
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER;
+        if (!GetSaveFileNameW(&ofn)) return;
+        std::wstring out = buf;
+        std::wstring e = extOf(out);
+        if (e != L"png" && e != L"jpg" && e != L"jpeg" && e != L"bmp" && e != L"tif" && e != L"tiff") {
+            static const wchar_t* ex[] = {L".png", L".jpg", L".bmp", L".tif"};
+            out += ex[std::max(1, std::min(4, (int)ofn.nFilterIndex)) - 1];
+        }
+        UINT rw = cur->texW, rh = cur->texH;
+        auto rsrc = rotatedForSave(cur->bmp.Get(), rw, rh, rotDeg, rw, rh);   // 另存为带上当前的旋转角度
+        if (!rsrc || !saveBitmapFile(rsrc.Get(), rw, rh, out)) MessageBoxW(hwnd, L"保存失败。", L"Xview", MB_OK | MB_ICONERROR);
+    }
+    void setWallpaper() {
+        if (idx < 0 || idx >= (int)files.size()) return;
+        std::wstring p = files[idx], e = extOf(p);
+        if (!(e == L"bmp" || e == L"jpg" || e == L"jpeg" || e == L"png") || std::fabs(std::fmod(rotDeg, 360.0)) > 1e-6) {   // 旋转过的图要先存成临时图再设
+            if (!cur || !cur->ok) return;
+            wchar_t tmp[MAX_PATH];
+            GetTempPathW(MAX_PATH, tmp);
+            p = std::wstring(tmp) + L"xview_wallpaper.png";
+            UINT rw = cur->texW, rh = cur->texH;
+            auto rsrc = rotatedForSave(cur->bmp.Get(), rw, rh, rotDeg, rw, rh);
+            if (!rsrc || !saveBitmapFile(rsrc.Get(), rw, rh, p)) { MessageBoxW(hwnd, L"设置壁纸失败。", L"Xview", MB_OK | MB_ICONERROR); return; }
+        }
+        SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, const_cast<wchar_t*>(p.c_str()), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+    }
+    void printCurrent() {
+        if (idx < 0 || idx >= (int)files.size()) return;
+        HINSTANCE r;
+        wchar_t pr[256] = L"";
+        DWORD pn = 256;
+        if (!cfg.getBool("Misc/PrintShowSetup", true) && GetDefaultPrinterW(pr, &pn)) {   // 不弹打印设置:直接送默认打印机
+            std::wstring args = L"\"" + std::wstring(pr) + L"\"";
+            r = ShellExecuteW(hwnd, L"printto", files[idx].c_str(), args.c_str(), nullptr, SW_SHOWNORMAL);
+        } else {
+            r = ShellExecuteW(hwnd, L"print", files[idx].c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        if ((INT_PTR)r <= 32) MessageBoxW(hwnd, L"系统里没有可以打印这种图片的程序。", L"Xview", MB_OK | MB_ICONINFORMATION);
+    }
+    void rotatePrompt() {
+        if (!hasImage()) return;
+        std::wstring t = L"90";
+        if (!promptText(hwnd, L"旋转", L"顺时针旋转的角度(负数为逆时针):", t)) return;
+        double d = wcstod(t.c_str(), nullptr);
+        if (d != 0.0) rotateBy(d);
+    }
+    void aboutBox() {
+        MessageBoxW(hwnd, L"Xview 原生看图\n\n纯 C++ / Direct2D,启动快、不依赖运行库。\n配置与 Xdir 共用 data\\config\\settings.ini。", L"关于 Xview", MB_OK | MB_ICONINFORMATION);
+    }
+
+    // ---------------- 交给 Xdir 办的命令(评分/色标/收藏存在 Xdir 的 SQLite 里,选项窗口是 Qt 写的)
+    static bool isXdirCmd(const std::string& c) {
+        static const char* const k[] = {"Options", "ManageExtensions", "FileAssoc", "FileUnassoc", "CommandPalette",
+                                        "Rate0", "Rate1", "Rate2", "Rate3", "Rate4", "Rate5",
+                                        "LabelRed", "LabelYellow", "LabelGreen", "LabelBlue", "ToggleFavorite", "ShowFavorites"};
+        for (auto* x : k) if (c == x) return true;
+        return false;
+    }
+    static bool xdirRunning() {
+        if (WaitNamedPipeW(L"\\\\.\\pipe\\Xdir-80101", 1)) return true;
+        return GetLastError() != ERROR_FILE_NOT_FOUND;
+    }
+    void sendXdir(const std::string& c) {
+        if (!xdirRunning()) {
+            MessageBoxW(hwnd, L"这个功能由 Xdir 来完成,但 Xdir 现在没有在运行。\n请先打开 Xdir,再从 Xdir 里打开图片。", L"Xview", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        std::wstring dir = root + L"\\data\\config\\native_cmd";
+        CreateDirectoryW((root + L"\\data").c_str(), nullptr);
+        CreateDirectoryW((root + L"\\data\\config").c_str(), nullptr);
+        CreateDirectoryW(dir.c_str(), nullptr);
+        static unsigned seq = 0;
+        std::wstring base = dir + L"\\" + std::to_wstring(GetTickCount64()) + L"_" + std::to_wstring(++seq);
+        std::string path = (idx >= 0 && idx < (int)files.size()) ? U(files[idx]) : std::string();
+        writeFileText(base + L".tmp", c + "\n" + path + "\n");
+        MoveFileExW((base + L".tmp").c_str(), (base + L".txt").c_str(), MOVEFILE_REPLACE_EXISTING);
+        if (c == "Options" || c == "ManageExtensions" || c == "FileAssoc" || c == "FileUnassoc" || c == "CommandPalette") {
+            // 弹窗在 Xdir 那边出现:把它带到前台
+            HWND x = FindWindowW(nullptr, L"Xdir");
+            if (x) SetForegroundWindow(x);
+        }
+    }
+
+    // ---------------- 深色标题栏 / 自动调整窗口 / 添加到列表
+    void applyTitleBar() {
+        if (!hwnd) return;
+        std::string m = cfg.get("Display/DarkTitleBar", "Auto");
+        bool dark;
+        if (m == "On") dark = true;
+        else if (m == "Off") dark = false;
+        else {
+            double lum = (0.2126 * ((th.bg >> 16) & 0xFF) + 0.7152 * ((th.bg >> 8) & 0xFF) + 0.0722 * (th.bg & 0xFF)) / 255.0;
+            dark = lum < 0.5;
+        }
+        if ((int)dark == darkApplied) return;
+        darkApplied = dark ? 1 : 0;
+        BOOL v = dark ? TRUE : FALSE;
+        if (FAILED(DwmSetWindowAttribute(hwnd, 20, &v, sizeof v))) DwmSetWindowAttribute(hwnd, 19, &v, sizeof v);
+    }
+    void resizeToImage() {
+        if (!cfg.getBool("Viewer/AutoResizeWindow", false) || fullscreen || !hwnd || IsZoomed(hwnd) || IsIconic(hwnd) || !cur || !cur->ok) return;
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        RECT wa = mi.rcWork;
+        DWORD st = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE), ex = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        RECT nc = {0, 0, 0, 0};
+        AdjustWindowRectExForDpi(&nc, st, GetMenu(hwnd) != nullptr, ex, (UINT)dpi);
+        int extraW = nc.right - nc.left, extraH = (nc.bottom - nc.top) + tbH() + stH() + filmH();
+        double availW = std::max(100, (int)(wa.right - wa.left) - extraW), availH = std::max(100, (int)(wa.bottom - wa.top) - extraH);
+        double w = effW(), h = effH(), sc = 1.0;
+        double fitSc = std::min(availW / w, availH / h);
+        if (fitSc < 1.0) { if (cfg.getBool("Viewer/ShrinkToScreen", true)) sc = fitSc; else sc = 1.0; }
+        else if (cfg.getBool("Viewer/EnlargeToScreen", true)) sc = fitSc;
+        int cw = std::max(240, std::min((int)availW, (int)(w * sc + 0.5))), ch = std::max(120, std::min((int)availH, (int)(h * sc + 0.5)));
+        int ww = cw + extraW, wh = ch + extraH;
+        RECT cr;
+        GetWindowRect(hwnd, &cr);
+        int x = cr.left, y = cr.top;
+        if (cfg.getBool("Viewer/CenterOnResize", true)) { x = wa.left + ((wa.right - wa.left) - ww) / 2; y = wa.top + ((wa.bottom - wa.top) - wh) / 2; }
+        x = std::max<int>(wa.left, std::min<int>(x, wa.right - ww));
+        y = std::max<int>(wa.top, std::min<int>(y, wa.bottom - wh));
+        SetWindowPos(hwnd, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    void addPath(std::wstring p, bool jump) {   // Misc/OnStartFile=AddToList / Misc/OnDropFile=Add:加进现有列表,不替换
+        p = absPath(p);
+        std::vector<std::wstring> add;
+        if (dirExists(p)) {
+            std::vector<std::wstring> old = files;
+            listDir(p);
+            add = files;
+            files = old;
+        } else if (fileExists(p)) add.push_back(p);
+        else return;
+        if (files.empty()) { openPath(p); return; }
+        int first = -1;
+        for (auto& f : add) {
+            int k = findFile(f);
+            if (k < 0) { files.push_back(f); k = (int)files.size() - 1; }
+            if (first < 0) first = k;
+        }
+        if (jump && first >= 0) go(first);
+        else { updateTitle(); invalidate(); }
+    }
+
+    // ---------------- 上一个 / 下一个文件夹(同一级的兄弟文件夹里第一个有图片的)
+    void siblingFolder(int dir) {
+        if (idx < 0 || idx >= (int)files.size()) return;
+        std::wstring curDir = parentDir(files[idx]);
+        std::wstring par = parentDir(curDir);
+        if (par.empty()) return;
+        std::vector<std::wstring> dirs;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW((par + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+                if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+                dirs.push_back(par + L"\\" + fd.cFileName);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        std::sort(dirs.begin(), dirs.end(), [](const std::wstring& a, const std::wstring& b) { return StrCmpLogicalW(baseName(a).c_str(), baseName(b).c_str()) < 0; });
+        int at = -1;
+        for (size_t i = 0; i < dirs.size(); ++i) if (lowerW(dirs[i]) == lowerW(curDir)) { at = (int)i; break; }
+        if (at < 0) return;
+        std::vector<std::wstring> oldFiles = files;
+        int oldIdx = idx;
+        for (int k = at + dir; k >= 0 && k < (int)dirs.size(); k += dir) {
+            listDir(dirs[k]);
+            if (!files.empty()) {
+                idx = dir > 0 ? 0 : (int)files.size() - 1;
+                cur.reset();
+                bitmap.Reset();
+                animBmps.clear();
+                showNow();
+                return;
+            }
+        }
+        files = oldFiles;
+        idx = oldIdx;
     }
 
     void run(const std::string& c) {
@@ -1412,6 +2518,22 @@ struct App {
         else if (c == "Delete") deleteCurrent();
         else if (c == "ToggleToolbar") { showToolbar = !showToolbar; if (fitAuto) refit(); else clampOffset(); invalidate(); }
         else if (c == "ToggleStatusBar") { showStatus = !showStatus; if (fitAuto) refit(); else clampOffset(); invalidate(); }
+        else if (c == "PrevFolder") siblingFolder(-1);
+        else if (c == "NextFolder") siblingFolder(1);
+        else if (c == "RotateBy") rotatePrompt();
+        else if (c == "SaveAs") saveAsDialog();
+        else if (c == "CopyTo") copyMoveCurrent(false);
+        else if (c == "MoveTo") copyMoveCurrent(true);
+        else if (c == "Rename") renameCurrent();
+        else if (c == "Undo") undoLast();
+        else if (c == "SetWallpaper") setWallpaper();
+        else if (c == "Print") printCurrent();
+        else if (c == "About") aboutBox();
+        else if (c == "ToggleMenu") { showMenu = !showMenu; applyMenu(); if (fitAuto) refit(); else clampOffset(); invalidate(); }
+        else if (c == "ToggleKeyHints") { keyHints = !keyHints; invalidate(); }
+        else if (c == "ToggleFilmstrip") { showFilm = !showFilm; if (fitAuto) refit(); else clampOffset(); invalidate(); }
+        else if (c == "ToggleSlideshow") toggleSlideshow();
+        else if (isXdirCmd(c)) sendXdir(c);
         else if (c == "ArrowLeft") arrow(-1, 0);
         else if (c == "ArrowRight") arrow(1, 0);
         else if (c == "ArrowUp") arrow(0, -1);
@@ -1547,10 +2669,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_LOADED:
             a->onLoaded();
             return 0;
+        case WM_APP_THUMB:
+            a->invalidate();
+            return 0;
         case WM_TIMER:
-            if (wp == TIMER_FLIP) { KillTimer(hwnd, TIMER_FLIP); a->showNow(); }
+            if (wp == TIMER_ANIM) a->stepAnim();
+            else if (wp == TIMER_SHOW) a->slideStep();
+            else if (wp == TIMER_FLIP) { KillTimer(hwnd, TIMER_FLIP); a->showNow(); }
             else if (wp == TIMER_CURSOR) {
-                if (a->fullscreen && a->cfg.getBool("Viewer/HideMouseInFullscreen", true) && GetTickCount() - a->lastMouse > 1500) a->showCursor(false);
+                if (a->fullscreen && a->cfg.getBool("Viewer/HideMouseInFullscreen", true) && GetTickCount() - a->lastMouse > (DWORD)std::max(200, a->cfg.getInt("Viewer/HideMouseDelayMs", 2000))) a->showCursor(false);
             }
             return 0;
         case WM_KEYDOWN:
@@ -1586,6 +2713,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
             int b = a->buttonAt(x, y);
             if (b >= 0) { a->downBtn = b; SetCapture(hwnd); a->invalidate(); return 0; }
+            if (a->filmClick(x, y)) return 0;
             if (y >= a->tbH() && a->cfg.get("Mouse/LeftDrag", "Pan") == "Pan" && a->hasImage() && (a->canPan(true) || a->canPan(false))) {
                 a->dragging = true;
                 a->dragLast = {x, y};
@@ -1658,18 +2786,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_DROPFILES: {
             wchar_t buf[MAX_PATH * 4];
-            if (DragQueryFileW((HDROP)wp, 0, buf, MAX_PATH * 4)) a->openPath(buf);
+            UINT nDrop = DragQueryFileW((HDROP)wp, 0xFFFFFFFF, nullptr, 0);
+            bool addMode = a->cfg.get("Misc/OnDropFile", "Add") == "Add";
+            for (UINT di = 0; di < nDrop; ++di) {
+                if (!DragQueryFileW((HDROP)wp, di, buf, MAX_PATH * 4)) continue;
+                if (di == 0 && !addMode) { a->openPath(buf); break; }
+                a->addPath(buf, di == 0);
+            }
             DragFinish((HDROP)wp);
             return 0;
         }
         case WM_COPYDATA: {
             auto* cd = reinterpret_cast<COPYDATASTRUCT*>(lp);
-            if (cd && cd->dwData == kCopyDataPath && cd->lpData && cd->cbData >= sizeof(wchar_t)) {
+            if (cd && (cd->dwData == kCopyDataPath || cd->dwData == kCopyDataPathAdd) && cd->lpData && cd->cbData >= sizeof(wchar_t)) {
                 std::wstring p((const wchar_t*)cd->lpData, cd->cbData / sizeof(wchar_t));
                 while (!p.empty() && p.back() == L'\0') p.pop_back();
                 if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
-                if (!p.empty()) a->openPath(p);
+                if (!p.empty()) {
+                    if (cd->dwData == kCopyDataPathAdd || a->cfg.get("Misc/OnStartFile", "AddToList") == "AddToList") a->addPath(p, true);
+                    else a->openPath(p);
+                }
                 return TRUE;
             }
             return FALSE;
@@ -1710,6 +2847,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         for (auto& f : flags) msg += L"\n  " + f;
         MessageBoxW(nullptr, msg.c_str(), L"Xview", MB_ICONINFORMATION);
         return 2;
+    }
+    // Misc/OnStartFile=NewWindow:不交给已有窗口,自己开一个新的
+    if (!newWindow && !paths.empty()) {
+        std::string ini = readFileText(root + L"\\data\\config\\settings.ini");
+        size_t at = ini.find("\nOnStartFile=");
+        if (at != std::string::npos && ini.compare(at + 13, 9, "NewWindow") == 0) newWindow = true;
     }
     // 已有窗口:把路径交给它
     if (!newWindow) {
@@ -1767,8 +2910,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     a.hwnd = hwnd;
     a.dpi = (int)GetDpiForWindow(hwnd);
     a.makeTextFormat();
+    a.applyTitleBar();
     DragAcceptFiles(hwnd, TRUE);
-    a.pool.start(2, poolWork);
+    a.pool.start(std::max(1, std::min(16, a.cfg.getInt("Viewer/LoadThreads", 2))), poolWork);
     if (a.topmost) a.setTopmost(true);
     ShowWindow(hwnd, maxed ? SW_SHOWMAXIMIZED : SW_SHOW);
     UpdateWindow(hwnd);
