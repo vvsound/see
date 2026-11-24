@@ -1,31 +1,24 @@
-name: build
-on: [push, workflow_dispatch]
+name: build-xview
+on:
+  push:
+  workflow_dispatch:
 jobs:
-  build:
-    runs-on: windows-2022
+  win:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: jurplel/install-qt-action@v4
-        with:
-          version: '6.5.3'
-          arch: 'win64_msvc2019_64'
-          modules: 'qtimageformats'
-      - uses: ilammy/msvc-dev-cmd@v1
-      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build
-      - run: |
-          New-Item -ItemType Directory dist
-          Copy-Item build\QuickView.exe dist\
-          windeployqt --release --no-compiler-runtime dist\QuickView.exe
-      - name: 瘦身(去掉本程序用不到的大文件:软件 OpenGL、D3D 编译器、翻译、TLS/网络/触摸插件)
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Collect
         shell: pwsh
         run: |
-          $junk = 'translations','opengl32sw.dll','D3Dcompiler_47.dll','dxcompiler.dll','dxil.dll',
-                  'tls','networkinformation','generic','plugins\tls','plugins\networkinformation','plugins\generic'
-          foreach ($j in $junk) { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path dist $j) }
-          $f = Get-ChildItem dist -Recurse -File
-          'dist: {0:N1} MB, {1} files' -f (($f | Measure-Object Length -Sum).Sum / 1MB), $f.Count
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/Release/Xview.exe dist/Xview.exe
+          Get-Item dist/Xview.exe | Format-List Name,Length
       - uses: actions/upload-artifact@v4
         with:
-          name: QuickView-win64
-          path: dist
+          name: Xview-win64
+          path: dist/Xview.exe
+          if-no-files-found: error

@@ -1,85 +1,24 @@
-cmake_minimum_required(VERSION 3.21)
-project(QuickView VERSION 0.1 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.15)
+project(Xview LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC OFF)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg PrintSupport Concurrent Network)
+if(NOT WIN32)
+  message(FATAL_ERROR "Xview 原生版只能在 Windows 上编译(GitHub 云端用 windows-latest)")
+endif()
 
-# 新增 .cpp 文件必须同时加到这里
-set(QV_SOURCES
-    src/main.cpp
-    src/MainWindow.h
-    src/MainWindow.cpp
-    src/core/Types.h
-    src/core/Config.h
-    src/core/Config.cpp
-    src/core/State.h
-    src/core/State.cpp
-    src/core/Strings.h
-    src/core/Strings.cpp
-    src/core/Commands.h
-    src/core/Commands.cpp
-    src/core/ImageLoader.h
-    src/core/ImageLoader.cpp
-    src/core/FolderList.h
-    src/core/FolderList.cpp
-    src/core/FileOps.h
-    src/core/FileOps.cpp
-    src/core/DescriptIon.h
-    src/core/DescriptIon.cpp
-    src/core/ThumbnailCache.h
-    src/core/ThumbnailCache.cpp
-    src/core/SingleInstance.h
-    src/core/SingleInstance.cpp
-    src/core/Cli.h
-    src/core/Cli.cpp
-    src/core/ExifReader.h
-    src/core/ExifReader.cpp
-    src/core/Theme.h
-    src/core/Theme.cpp
-    src/core/CustomCommands.h
-    src/core/CustomCommands.cpp
-    src/ui/ViewerWidget.h
-    src/ui/ViewerWidget.cpp
-    src/ui/BrowserWidget.h
-    src/ui/BrowserWidget.cpp
-    src/ui/FileListModel.h
-    src/ui/FileListModel.cpp
-    src/ui/InfoPanel.h
-    src/ui/InfoPanel.cpp
-    src/ui/FilterBar.h
-    src/ui/FilterBar.cpp
-    src/ui/PreviewPane.h
-    src/ui/PreviewPane.cpp
-    src/ui/OptionsDialog.h
-    src/ui/OptionsDialog.cpp
-    src/ui/ExtensionsDialog.h
-    src/ui/ExtensionsDialog.cpp
-    src/platform/FileAssoc.h
-    src/platform/FileAssoc.cpp
-    src/platform/Shell.h
-    src/platform/Shell.cpp
-    resources/resources.qrc
+# 静态链接 C++ 运行库:exe 不依赖 VC++ 运行库,拷到任何 Windows 10/11 都能运行
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+
+add_executable(Xview WIN32
+  src/main.cpp
+  resources/app.rc
 )
 
-add_executable(QuickView WIN32 ${QV_SOURCES})
-if(WIN32)
-    # exe 文件本身的图标和版本信息(资源管理器、任务栏、默认应用列表显示的就是它)
-    enable_language(RC)
-    target_sources(QuickView PRIVATE resources/app.rc)
-endif()
-target_include_directories(QuickView PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(QuickView PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::PrintSupport Qt6::Concurrent Qt6::Network)
-
-if(MSVC)
-    target_compile_options(QuickView PRIVATE /utf-8 /W3)
-    target_link_options(QuickView PRIVATE /ENTRY:mainCRTStartup)
-endif()
-if(WIN32)
-    target_link_libraries(QuickView PRIVATE advapi32 shell32 user32 dwmapi)
-endif()
+target_compile_definitions(Xview PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(Xview PRIVATE /utf-8 /W3 /EHsc /O2)
+target_link_options(Xview PRIVATE /OPT:REF /OPT:ICF /MANIFEST:NO)
+target_include_directories(Xview PRIVATE src)
+target_link_libraries(Xview PRIVATE d2d1 dwrite windowscodecs ole32 oleaut32 user32 gdi32 shell32 shlwapi comdlg32 uuid)
