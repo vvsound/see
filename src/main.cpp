@@ -1,17 +1,23 @@
 // Xview 原生版:纯 C++ / Win32 / Direct2D / WIC 看图程序。
 //  - 解码:WIC(系统自带,JPG PNG BMP GIF TIFF ICO,以及系统装了编码器的 WebP HEIF AVIF 等)
+//    自己解码(codecs.h,不依赖任何别的程序):PSD/PSB、HDR、EXR、相机 RAW 的内嵌预览;
+//    SVG/SVGZ 用 Direct2D;AI/EPS/CDR 向 Windows 要预览图
 //  - 显示:Direct2D(GPU 贴图,缩放平移不重新解码)
 //  - 配置:全部读外置文件(app\config\*、data\config\*),本程序只写 data\config\native.ini
-//  - 读不了的格式(RAW PSD SVG HDR…)和 "--" 开头的命令行选项:交给 Python 版(app\src\main.pyw)
-// 目录布局和 Python 版一致:Xview.exe 放在项目根,旁边是 app\ 和 data\。
+//  - 没有任何 Python 回退:读不了的图只显示错误提示。
+// 目录布局:Xview.exe 放在项目根,旁边是 app\ 和 data\。
 #include <windows.h>
 #include <windowsx.h>
 #include <commdlg.h>
+#include <d2d1_3.h>
+#include <d3d11.h>
+#include <dxgi.h>
 #include <d2d1.h>
 #include <d2d1helper.h>
 #include <dwrite.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <shlwapi.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -32,11 +38,15 @@
 #include <thread>
 #include <vector>
 
+#include "codecs.h"
 #include "ini.h"
 #include "json.h"
 #include "keymap.h"
 #include "layout.h"
 #include "svgpath.h"
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
 using Microsoft::WRL::ComPtr;
 using namespace xv;
@@ -198,6 +208,140 @@ bool scaleDownTo(IWICBitmap* in, UINT maxSide, ComPtr<IWICBitmap>& out, UINT& w,
     return true;
 }
 
+bool isRawExt(const std::wstring& e) {
+    static const wchar_t* k[] = {L"cr2", L"cr3", L"crw", L"nef", L"nrw", L"arw", L"srf", L"sr2", L"dng", L"orf", L"rw2", L"raf",
+                                 L"pef", L"srw", L"x3f", L"3fr", L"erf", L"kdc", L"mrw", L"raw"};
+    for (auto x : k) if (e == x) return true;
+    return false;
+}
+
+bool readAllBytes(const std::wstring& path, std::vector<uint8_t>& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 0x7FFFFFFFLL * 2) { CloseHandle(h); return false; }
+    try { out.resize((size_t)sz.QuadPart); } catch (...) { CloseHandle(h); return false; }
+    size_t done = 0;
+    bool ok = true;
+    while (done < out.size()) {
+        DWORD got = 0, want = (DWORD)std::min<size_t>(out.size() - done, 64u << 20);
+        if (!ReadFile(h, out.data() + done, want, &got, nullptr) || got == 0) { ok = false; break; }
+        done += got;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+// ---- SVG:用 Direct2D 自带的 SVG 渲染(Windows 10 1703 以上)。D2D 设备上下文不能多线程同时用,所以整个渲染过程加锁。
+struct SvgCtx {
+    std::mutex m;
+    ComPtr<ID3D11Device> d3d;
+    ComPtr<ID2D1Factory1> fac;
+    ComPtr<ID2D1Device> dev;
+    ComPtr<ID2D1DeviceContext5> dc;
+    bool tried = false, ok = false;
+};
+SvgCtx g_svg;
+
+bool svgInit() {
+    if (g_svg.tried) return g_svg.ok;
+    g_svg.tried = true;
+    UINT fl = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, fl, nullptr, 0, D3D11_SDK_VERSION, &g_svg.d3d, nullptr, nullptr);
+    if (FAILED(hr)) hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, fl, nullptr, 0, D3D11_SDK_VERSION, &g_svg.d3d, nullptr, nullptr);
+    if (FAILED(hr)) return false;
+    ComPtr<IDXGIDevice> dxgi;
+    if (FAILED(g_svg.d3d.As(&dxgi))) return false;
+    D2D1_FACTORY_OPTIONS opt;
+    ZeroMemory(&opt, sizeof opt);
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, __uuidof(ID2D1Factory1), &opt, reinterpret_cast<void**>(g_svg.fac.GetAddressOf())))) return false;
+    if (FAILED(g_svg.fac->CreateDevice(dxgi.Get(), &g_svg.dev))) return false;
+    ComPtr<ID2D1DeviceContext> dc1;
+    if (FAILED(g_svg.dev->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc1))) return false;
+    if (FAILED(dc1.As(&g_svg.dc))) return false;   // 没有 ID2D1DeviceContext5 = 系统太旧,不支持 SVG
+    g_svg.ok = true;
+    return true;
+}
+
+bool renderSvg(const std::vector<uint8_t>& data, ComPtr<IWICBitmap>& out, UINT& outW, UINT& outH) {
+    std::lock_guard<std::mutex> lk(g_svg.m);
+    if (!svgInit()) return false;
+    ComPtr<IStream> st;
+    st.Attach(SHCreateMemStream(data.data(), (UINT)data.size()));
+    if (!st) return false;
+    ComPtr<ID2D1SvgDocument> doc;
+    if (FAILED(g_svg.dc->CreateSvgDocument(st.Get(), D2D1::SizeF(1024.0f, 1024.0f), &doc)) || !doc) return false;
+    ComPtr<ID2D1SvgElement> root;
+    doc->GetRoot(&root);
+    if (!root) return false;
+    D2D1_SVG_VIEWBOX vb;
+    ZeroMemory(&vb, sizeof vb);
+    bool hasVb = root->IsAttributeSpecified(L"viewBox", nullptr) &&
+                 SUCCEEDED(root->GetAttributeValue(L"viewBox", D2D1_SVG_ATTRIBUTE_POD_TYPE_VIEWBOX, &vb, sizeof vb)) && vb.width > 0 && vb.height > 0;
+    if (!hasVb) {   // 没有 viewBox:用 width/height(纯数字)当画布,都没有就按 1024 见方
+        float vw = 1024.0f, vh = 1024.0f;
+        D2D1_SVG_LENGTH lw, lh;
+        ZeroMemory(&lw, sizeof lw);
+        ZeroMemory(&lh, sizeof lh);
+        if (root->IsAttributeSpecified(L"width", nullptr) && SUCCEEDED(root->GetAttributeValue(L"width", D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH, &lw, sizeof lw)) &&
+            lw.units == D2D1_SVG_LENGTH_UNITS_NUMBER && lw.value > 0) vw = lw.value;
+        if (root->IsAttributeSpecified(L"height", nullptr) && SUCCEEDED(root->GetAttributeValue(L"height", D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH, &lh, sizeof lh)) &&
+            lh.units == D2D1_SVG_LENGTH_UNITS_NUMBER && lh.value > 0) vh = lh.value;
+        vb.x = 0; vb.y = 0; vb.width = vw; vb.height = vh;
+        root->SetAttributeValue(L"viewBox", D2D1_SVG_ATTRIBUTE_POD_TYPE_VIEWBOX, &vb, sizeof vb);
+    }
+    const double kSide = 2048.0;   // 长边渲染到 2048 像素,放大看也清楚
+    UINT W, H;
+    if (vb.width >= vb.height) { W = (UINT)kSide; H = (UINT)std::max(1.0, std::floor(kSide * vb.height / vb.width + 0.5)); }
+    else { H = (UINT)kSide; W = (UINT)std::max(1.0, std::floor(kSide * vb.width / vb.height + 0.5)); }
+    D2D1_SVG_LENGTH nl;
+    nl.value = (float)W; nl.units = D2D1_SVG_LENGTH_UNITS_NUMBER;
+    root->SetAttributeValue(L"width", D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH, &nl, sizeof nl);
+    nl.value = (float)H;
+    root->SetAttributeValue(L"height", D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH, &nl, sizeof nl);
+    doc->SetViewportSize(D2D1::SizeF((float)W, (float)H));
+
+    D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ComPtr<ID2D1Bitmap1> tgt;
+    if (FAILED(g_svg.dc->CreateBitmap(D2D1::SizeU(W, H), nullptr, 0, bp, &tgt))) return false;
+    g_svg.dc->SetTarget(tgt.Get());
+    g_svg.dc->BeginDraw();
+    g_svg.dc->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+    g_svg.dc->DrawSvgDocument(doc.Get());
+    HRESULT hr = g_svg.dc->EndDraw();
+    g_svg.dc->SetTarget(nullptr);
+    if (FAILED(hr)) return false;
+    D2D1_BITMAP_PROPERTIES1 sp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ComPtr<ID2D1Bitmap1> stg;
+    if (FAILED(g_svg.dc->CreateBitmap(D2D1::SizeU(W, H), nullptr, 0, sp, &stg))) return false;
+    if (FAILED(stg->CopyFromBitmap(nullptr, tgt.Get(), nullptr))) return false;
+    D2D1_MAPPED_RECT mr;
+    if (FAILED(stg->Map(D2D1_MAP_OPTIONS_READ, &mr))) return false;
+    std::vector<uint8_t> px((size_t)W * H * 4);
+    for (UINT y = 0; y < H; ++y) std::memcpy(&px[(size_t)y * W * 4], mr.bits + (size_t)y * mr.pitch, (size_t)W * 4);
+    stg->Unmap();
+    if (FAILED(g_wic->CreateBitmapFromMemory(W, H, GUID_WICPixelFormat32bppPBGRA, W * 4, (UINT)px.size(), px.data(), &out))) return false;
+    outW = W;
+    outH = H;
+    return true;
+}
+
+// ---- 向 Windows 要预览图:AI / EPS / CDR 这类自己不画的格式(装了 Illustrator / CorelDRAW 之后系统才认得)
+bool shellThumb(const std::wstring& path, ComPtr<IWICBitmap>& out, UINT& outW, UINT& outH) {
+    ComPtr<IShellItemImageFactory> f;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&f))) || !f) return false;
+    HBITMAP hb = nullptr;
+    SIZE sz;
+    sz.cx = 2048;
+    sz.cy = 2048;
+    if (FAILED(f->GetImage(sz, SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY, &hb)) || !hb) return false;
+    HRESULT hr = g_wic->CreateBitmapFromHBITMAP(hb, nullptr, WICBitmapUseAlpha, &out);
+    DeleteObject(hb);
+    if (FAILED(hr) || !out) return false;
+    out->GetSize(&outW, &outH);
+    return outW > 0 && outH > 0;
+}
+
 std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
     auto t0 = std::chrono::steady_clock::now();
     auto r = std::make_shared<Loaded>();
@@ -209,39 +353,123 @@ std::shared_ptr<Loaded> decodeFile(const std::wstring& path) {
     std::wstring ext = extOf(path);
     r->format = (ext == L"jpg" || ext == L"jpe" || ext == L"jfif") ? "jpeg" : U(ext);
 
-    ComPtr<IWICBitmapDecoder> dec;
-    if (FAILED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return r;
-    GUID cf;
-    if (SUCCEEDED(dec->GetContainerFormat(&cf))) {
-        if (cf == GUID_ContainerFormatJpeg) r->format = "jpeg";
-        else if (cf == GUID_ContainerFormatPng) r->format = "png";
-        else if (cf == GUID_ContainerFormatGif) r->format = "gif";
-        else if (cf == GUID_ContainerFormatBmp) r->format = "bmp";
-        else if (cf == GUID_ContainerFormatTiff) r->format = "tiff";
-        else if (cf == GUID_ContainerFormatIco) r->format = "ico";
-    }
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(dec->GetFrame(0, &frame))) return r;
+    ComPtr<IWICBitmapSource> src;
     UINT w = 0, h = 0;
-    if (FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0) return r;
+    int orient = 1;
+    bool custom = false;   // 自己解码出来的(PSD / HDR):已经是预乘 BGRA 的 WIC 位图
+    const bool isPsd = (ext == L"psd" || ext == L"psb"), isHdr = (ext == L"hdr"), isExr = (ext == L"exr"), isRaw = isRawExt(ext);
+    const bool isSvg = (ext == L"svg" || ext == L"svgz"), isShell = (ext == L"ai" || ext == L"eps" || ext == L"cdr");
+    ComPtr<IWICBitmapDecoder> dec;
 
-    WICPixelFormatGUID pf;
-    if (SUCCEEDED(frame->GetPixelFormat(&pf))) {
-        ComPtr<IWICComponentInfo> ci;
-        if (SUCCEEDED(g_wic->CreateComponentInfo(pf, &ci))) {
-            ComPtr<IWICPixelFormatInfo> pi;
-            if (SUCCEEDED(ci.As(&pi))) {
-                UINT bpp = 0;
-                if (SUCCEEDED(pi->GetBitsPerPixel(&bpp))) r->bits = (int)bpp;
-            }
+    auto useShell = [&]() -> bool {   // 向 Windows 要预览图,成功就当作"自己解码出来的"
+        ComPtr<IWICBitmap> sb;
+        UINT sw = 0, sh = 0;
+        if (!shellThumb(path, sb, sw, sh)) return false;
+        sb.As(&src);
+        w = sw;
+        h = sh;
+        r->bits = 32;
+        custom = true;
+        return true;
+    };
+
+    if (isSvg) {
+        std::vector<uint8_t> blob;
+        if (!readAllBytes(path, blob)) return r;
+        if (blob.size() > 2 && blob[0] == 0x1F && blob[1] == 0x8B) {   // .svgz = gzip 压缩的 SVG
+            std::vector<uint8_t> raw;
+            if (!xcodec::gunzip(blob.data(), blob.size(), raw, (size_t)256 << 20)) { r->err = "无法读取这个 SVGZ(解压失败)"; return r; }
+            blob.swap(raw);
+        }
+        ComPtr<IWICBitmap> sb;
+        UINT sw = 0, sh = 0;
+        if (!renderSvg(blob, sb, sw, sh)) { r->err = "无法渲染这个 SVG(文件有问题,或系统低于 Windows 10 1703)"; return r; }
+        sb.As(&src);
+        w = sw;
+        h = sh;
+        r->bits = 32;
+        r->format = "svg";
+        custom = true;
+    } else if (isShell) {
+        if (!useShell()) { r->err = "Windows 没有给这个文件生成预览图(需要安装能打开它的软件,如 Illustrator / CorelDRAW)"; return r; }
+    } else if (isPsd || isHdr || isExr) {
+        std::vector<uint8_t> blob;
+        if (!readAllBytes(path, blob)) return r;
+        xcodec::Image im;
+        std::string e2;
+        if (!(isPsd ? xcodec::decodePsd(blob.data(), blob.size(), im, e2) : isExr ? xcodec::decodeExr(blob.data(), blob.size(), im, e2) : xcodec::decodeHdr(blob.data(), blob.size(), im, e2))) {
+            r->err = "无法读取这张图片:" + e2;
+            return r;
+        }
+        blob.clear();
+        blob.shrink_to_fit();
+        ComPtr<IWICBitmap> mb;
+        if (FAILED(g_wic->CreateBitmapFromMemory((UINT)im.w, (UINT)im.h, GUID_WICPixelFormat32bppPBGRA, (UINT)im.w * 4, (UINT)im.bgra.size(), im.bgra.data(), &mb))) return r;
+        mb.As(&src);
+        w = (UINT)im.w;
+        h = (UINT)im.h;
+        r->bits = im.bits;
+        r->format = im.format;
+        custom = true;
+    } else if (isRaw) {   // 相机 RAW:取文件里最大的内嵌 JPEG 预览
+        std::vector<uint8_t> blob;
+        if (!readAllBytes(path, blob)) return r;
+        size_t off = 0, len = 0;
+        if (!xcodec::findRawPreview(blob.data(), blob.size(), off, len)) { r->err = "这个 RAW 文件里没有找到内嵌的预览图"; return r; }
+        orient = xcodec::rawOrientation(blob.data(), blob.size());
+        ComPtr<IStream> st;
+        st.Attach(SHCreateMemStream(blob.data() + off, (UINT)len));   // 会复制一份,blob 可以释放
+        if (!st) return r;
+        if (FAILED(g_wic->CreateDecoderFromStream(st.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &dec))) return r;
+    } else {
+        if (FAILED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) {
+            if (!useShell()) return r;   // 系统解码器不认:最后问问 Windows 有没有预览图
         }
     }
-    int orient = 1;
-    queryOrientation(frame.Get(), orient);
+
+    if (!custom) {
+        GUID cf;
+        bool isIco = false;
+        if (SUCCEEDED(dec->GetContainerFormat(&cf)) && !isRaw) {
+            if (cf == GUID_ContainerFormatJpeg) r->format = "jpeg";
+            else if (cf == GUID_ContainerFormatPng) r->format = "png";
+            else if (cf == GUID_ContainerFormatGif) r->format = "gif";
+            else if (cf == GUID_ContainerFormatBmp) r->format = "bmp";
+            else if (cf == GUID_ContainerFormatTiff) r->format = "tiff";
+            else if (cf == GUID_ContainerFormatIco) { r->format = "ico"; isIco = true; }
+        }
+        UINT fidx = 0;
+        if (isIco) {   // 图标里常有 16~256 多个尺寸:取最大的那张
+            UINT fc = 0;
+            if (SUCCEEDED(dec->GetFrameCount(&fc))) {
+                unsigned long long best = 0;
+                for (UINT k = 0; k < fc; ++k) {
+                    ComPtr<IWICBitmapFrameDecode> f2;
+                    UINT fw = 0, fh = 0;
+                    if (SUCCEEDED(dec->GetFrame(k, &f2)) && SUCCEEDED(f2->GetSize(&fw, &fh)) && (unsigned long long)fw * fh > best) { best = (unsigned long long)fw * fh; fidx = k; }
+                }
+            }
+        }
+        ComPtr<IWICBitmapFrameDecode> frame;
+        if (FAILED(dec->GetFrame(fidx, &frame))) return r;
+        if (FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0) return r;
+        WICPixelFormatGUID pf;
+        if (SUCCEEDED(frame->GetPixelFormat(&pf))) {
+            ComPtr<IWICComponentInfo> ci;
+            if (SUCCEEDED(g_wic->CreateComponentInfo(pf, &ci))) {
+                ComPtr<IWICPixelFormatInfo> pi;
+                if (SUCCEEDED(ci.As(&pi))) {
+                    UINT bpp = 0;
+                    if (SUCCEEDED(pi->GetBitsPerPixel(&bpp))) r->bits = (int)bpp;
+                }
+            }
+        }
+        int fo = 1;
+        if (queryOrientation(frame.Get(), fo) && !(isRaw && orient != 1)) orient = fo;   // RAW 以容器里的方向为准
+        frame.As(&src);
+    }
 
     // 先缩到不超过 16384(再大的图显卡贴不上),再转成预乘 BGRA
-    ComPtr<IWICBitmapSource> src;
-    frame.As(&src);
     const UINT kMaxSide = 16384;
     if (w > kMaxSide || h > kMaxSide) {
         double k = (double)kMaxSide / (double)std::max(w, h);
@@ -351,55 +579,6 @@ private:
     std::set<std::wstring> inflight_;
     size_t bytes_ = 0, limit_;
 };
-
-// ------------------------------------------------------------------ Python 版(备用)
-std::wstring firstLineOf(const std::wstring& file) {
-    std::string s = readFileText(file);
-    if (s.compare(0, 3, "\xEF\xBB\xBF") == 0) s.erase(0, 3);
-    size_t e = s.find_first_of("\r\n");
-    if (e != std::string::npos) s.erase(e);
-    std::wstring w = W(s);
-    while (!w.empty() && (w.back() == L' ' || w.back() == L'\t' || w.back() == L'"')) w.pop_back();
-    size_t b = 0;
-    while (b < w.size() && (w[b] == L' ' || w[b] == L'\t' || w[b] == L'"')) ++b;
-    return w.substr(b);
-}
-
-std::wstring findPythonw(const std::wstring& root) {
-    std::wstring cfg = firstLineOf(root + L"\\data\\config\\python.txt");
-    if (!cfg.empty()) {
-        bool abs = (cfg.size() >= 2 && cfg[1] == L':') || cfg.rfind(L"\\\\", 0) == 0;
-        std::wstring p = abs ? cfg : root + L"\\" + cfg;
-        if (dirExists(p)) p += L"\\pythonw.exe";
-        if (fileExists(p)) return p;
-    }
-    wchar_t buf[MAX_PATH * 4];
-    DWORD n = SearchPathW(nullptr, L"pythonw.exe", nullptr, MAX_PATH * 4, buf, nullptr);
-    return (n > 0 && n < MAX_PATH * 4) ? std::wstring(buf, n) : L"";
-}
-
-bool pythonAvailable(const std::wstring& root) {
-    return fileExists(root + L"\\app\\src\\main.pyw") && !findPythonw(root).empty();
-}
-
-bool launchPython(const std::wstring& root, const std::vector<std::wstring>& args) {
-    std::wstring py = findPythonw(root);
-    std::wstring script = root + L"\\app\\src\\main.pyw";
-    if (py.empty() || !fileExists(script)) return false;
-    std::wstring cmd = quoteArg(py) + L" " + quoteArg(script);
-    for (auto& a : args) cmd += L" " + quoteArg(a);
-    std::vector<wchar_t> line(cmd.begin(), cmd.end());
-    line.push_back(0);
-    STARTUPINFOW si;
-    ZeroMemory(&si, sizeof si);
-    si.cb = sizeof si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof pi);
-    if (!CreateProcessW(py.c_str(), line.data(), nullptr, nullptr, FALSE, 0, nullptr, root.c_str(), &si, &pi)) return false;
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return true;
-}
 
 // ------------------------------------------------------------------ 解码线程池(预读 + 当前图)
 class Pool {
@@ -585,7 +764,7 @@ struct App {
         }
         // 图片扩展名
         for (auto& e : cfg.getList("Files/Extensions")) exts.insert(lowerW(W(e)));
-        if (exts.empty()) for (auto e : {L"jpg", L"jpeg", L"png", L"gif", L"bmp", L"webp", L"tif", L"tiff", L"ico", L"jfif"}) exts.insert(e);
+        if (exts.empty()) for (auto e : {L"jpg", L"jpeg", L"png", L"gif", L"bmp", L"webp", L"tif", L"tiff", L"ico", L"jfif", L"psd", L"psb", L"hdr", L"exr", L"svg", L"svgz"}) exts.insert(e);
         // 快捷键:只收录原生版实现了的命令
         for (auto c : kCmds) keys.add(c, cfg.getList(std::string("Keys/") + c));
         showToolbar = cfg.getBool("Viewer/ShowToolbar", true);
@@ -1014,7 +1193,6 @@ struct App {
 
     void present(std::shared_ptr<Loaded> l) {
         bool hadImage = hasImage();
-        firstShow = false;
         cur = l;
         bitmap.Reset();
         runtimeErr.clear();
@@ -1038,18 +1216,7 @@ struct App {
         if (cur && lowerW(cur->path) == lowerW(files[idx])) return;
         auto c = cache.get(files[idx]);
         if (!c) return;
-        if (!c->ok && firstShow && tryPythonFor(files[idx])) return;
-        firstShow = false;
-        present(c);
-    }
-    bool firstShow = true;   // 第一张图读不了才交给 Python 版;之后翻页遇到坏图只显示错误
-
-    bool tryPythonFor(const std::wstring& path) {   // 第一张就读不了:交给 Python 版(它支持 RAW/PSD/SVG/HDR…)
-        if (nat.get("Native/PythonFallback", "1") == "0") return false;
-        if (!pythonAvailable(root)) return false;
-        if (!launchPython(root, {path})) return false;
-        PostMessageW(hwnd, WM_CLOSE, 0, 0);
-        return true;
+        present(c);   // 读不了的图:画面上显示错误提示(不会交给别的程序)
     }
 
     void updateTitle() {
@@ -1312,7 +1479,7 @@ struct App {
         RECT r = wp.rcNormalPosition;
         std::string v = std::to_string(r.left) + "," + std::to_string(r.top) + "," + std::to_string(r.right - r.left) + "," + std::to_string(r.bottom - r.top) + "," + (wp.showCmd == SW_SHOWMAXIMIZED ? "1" : "0");
         nat.kv["Native/Window"] = v;
-        std::string out = "; Xview 原生版自己的记忆(窗口位置)。可以删除,不影响其他设置。\n; PythonFallback=0 可关闭\"读不了的格式交给 Python 版\"\n[Native]\n";
+        std::string out = "; Xview 原生版自己的记忆(窗口位置)。可以删除,不影响其他设置。\n[Native]\n";
         for (auto& p : nat.kv)
             if (p.first.compare(0, 7, "Native/") == 0) out += p.first.substr(7) + "=" + p.second + "\n";
         CreateDirectoryW((root + L"\\data").c_str(), nullptr);
@@ -1515,12 +1682,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     // "--warm" = 登录预热:原生版本来就很快,什么也不用做
     if (std::find(flags.begin(), flags.end(), L"--warm") != flags.end() && flags.size() == 1) return 0;
-    // 其他 "--xxx"(选项对话框用的 --list-formats / --assoc-machine 等):交给 Python 版
-    if (!flags.empty()) {
-        std::vector<std::wstring> all = flags;
-        for (auto& p : paths) all.push_back(p);
-        if (launchPython(root, all)) return 0;
-        MessageBoxW(nullptr, L"这个命令行选项需要 Python 版(找不到 pythonw.exe 或 app\\src\\main.pyw)。", L"Xview", MB_ICONERROR);
+    // 其他 "--xxx"(原来 Python 版的选项对话框用的 --list-formats / --assoc-machine 等):原生版没有这些功能,明说,不再转交别的程序
+    if (!flags.empty() && paths.empty()) {
+        std::wstring msg = L"原生版 Xview 不支持这些命令行选项:";
+        for (auto& f : flags) msg += L"\n  " + f;
+        MessageBoxW(nullptr, msg.c_str(), L"Xview", MB_ICONINFORMATION);
         return 2;
     }
     // 已有窗口:把路径交给它
