@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     CHECK(fmtArgs(unescape(loc.get("/status.index")), "6", "8") == "6/8");
     CHECK(fmtArgs(loc.get("/status.zoom"), "44") == "44%");
     CHECK(fmtArgs(loc.get("/status.loadTime"), "0.12") == "在 0.12 秒内载入");
-    CHECK(fmtArgs(loc.get("/app.titleFormat"), "a.jpg") == "a.jpg - QuickView");
+    CHECK(fmtArgs(loc.get("/app.titleFormat"), "a.jpg") == "a.jpg - Xview");
 
     Json cj;
     CHECK(parseJson(slurp(root + "/app/config/commands.json"), cj) && cj.t == Json::Arr && cj.a.size() > 40);
